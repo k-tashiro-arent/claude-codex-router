@@ -60,6 +60,17 @@ import random
 import sys
 import time
 
+USAGE = """claude-codex-router: pick Claude or Codex for the next task from the headroom of both usage limits.
+
+usage:
+  router.py now [--json] [--main claude|codex]  decide now (reads both, also records). exit 0=both read 1=one side 2=neither
+  router.py sample      read both and record; add cost rows from the conversation logs (the timer calls this every 5 min)
+  router.py calibrate   relearn the mixing weights from the cost records (sample calls this once a day)
+  router.py import      import past records on this machine (conversation-log costs, ~/.codex/sessions usage, claude-token-pace; no duplicates)
+
+now --json fields: pick, main, reason (full|guard|tie|leftover|codex_unreadable|claude_unreadable|both_unreadable), tie, guard, full,
+  claude_L, codex_L, windows, errors, notes. Data and settings: $CLAUDE_CODEX_ROUTER_DIR (default ~/.claude/codex-router)."""
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_DEFAULTS = os.path.join(os.path.dirname(HERE), 'defaults')   # リポジトリから直接動かすとき
 DIR = os.path.expanduser(os.environ.get('CLAUDE_CODEX_ROUTER_DIR') or '~/.claude/codex-router')
@@ -69,6 +80,8 @@ COST_LOG = {'claude': os.path.join(DATA, 'cost-claude.jsonl'), 'codex': os.path.
 COST_STATE = os.path.join(DATA, 'cost-state.json')
 PRICE_FILE = os.path.join(DATA, 'litellm-prices.json')
 WEIGHTS_FILE = os.path.join(DATA, 'weights.json')
+SAMPLE_STAMP = os.path.join(DATA, 'last-sample')   # sample が最後に動いた時刻（定期の記録が止まっていないかの確かめ）
+VERSION_FILE = os.path.join(DIR, '.version')       # 入れた時刻の代わり（sample がまだ一度も動いていないとき）
 TP = os.path.expanduser(os.environ.get('TOKEN_PACE_DIR') or '~/.claude/token-pace') + '/'   # import の取り込み元（在れば）
 CLAUDE_HOME = os.path.expanduser(os.environ.get('CLAUDE_CONFIG_DIR') or '~/.claude')
 CODEX_HOME = os.path.expanduser(os.environ.get('CODEX_HOME') or '~/.codex')
@@ -120,7 +133,7 @@ def fetch_prices(timeout=30):
     with urllib.request.urlopen(PRICE_URL, timeout=timeout) as r:
         d = json.load(r)
     if not isinstance(d, dict) or len(d) < 100:
-        raise ValueError('単価データの形が想定と違う')
+        raise ValueError('unexpected price data format')
     os.makedirs(DATA, exist_ok=True)
     tmp = PRICE_FILE + '.tmp'
     json.dump(d, open(tmp, 'w'))
@@ -139,10 +152,10 @@ def load_prices(refresh=False):
             _prices, _price_src = fetch_prices(), 'fetched'
             return _prices
         except Exception as e:   # noqa: BLE001 — 取れなければ控えを使う
-            _price_src = f'取れなかった（{e}）'
+            _price_src = f'fetch failed ({e})'
     try:
         _prices = json.load(open(PRICE_FILE))
-        _price_src = _price_src or ('控え（1 日より古い）' if stale else '控え')
+        _price_src = _price_src or ('cache (older than 1 day)' if stale else 'cache')
     except (OSError, ValueError):
         _prices = {}
     return _prices
@@ -353,7 +366,7 @@ def cost_events(side, scope_model=None):
         c = cost_of(side, x)
         if c is None:
             if x.get('model') != '<synthetic>':   # Claude Code が自分で書く応答（API を呼んでいない）
-                miss.add(x.get('model') or '（モデルの記録なし）')
+                miss.add(x.get('model') or '(no model recorded)')
             c = 0.0
         ev.append((x['ts'], c))
     ev.sort()
@@ -767,7 +780,7 @@ def calibrate(quiet=False, every=8, sub=50, step=0.05):
     t = time.time()
     ev, _ = cost_events(MAIN_SIDE_FOR_WEIGHTS)
     if not ev:
-        quiet or print('料金の記録が無い')
+        quiet or print('no cost records')
         return None
     cs_ = CostSeries(ev, t)
     xs = [h * 4 for h in W_HOURS]
@@ -805,15 +818,15 @@ def calibrate(quiet=False, every=8, sub=50, step=0.05):
         b = [[sum(r[x][y] for r in B[h]) / len(B[h]) for y in range(k)] for x in range(k)]
         best = min(grid, key=lambda w: sum(w[j] * a[j] for j in range(k)) - 0.5 * sum(w[x] * w[y] * b[x][y] for x in range(k) for y in range(k)))
         out[h] = best
-        quiet or print(f'{h} 時間：開始 {len(A[h])}  重み ' + ' '.join(f'{nm} {v:.2f}' for nm, v in zip(PARTS, best)))
+        quiet or print(f'{h}h: origins {len(A[h])}  weights ' + ' '.join(f'{nm} {v:.2f}' for nm, v in zip(PARTS, best)))
     if not out:
-        quiet or print('学べる開始が足りない（既定の重みのまま）')
+        quiet or print('not enough origins to learn from (keeping default weights)')
         return None
     os.makedirs(DATA, exist_ok=True)
     tmp = WEIGHTS_FILE + '.tmp'
     json.dump({'parts': PARTS, 'weights': {str(h): w for h, w in out.items()}, 'n_origins': {str(h): len(A[h]) for h in out}}, open(tmp, 'w'))
     os.replace(tmp, WEIGHTS_FILE)
-    quiet or print('→', WEIGHTS_FILE)
+    quiet or print('->', WEIGHTS_FILE)
     return out
 
 
@@ -1021,11 +1034,11 @@ def window_states(rows, t, log=None, n=N_SAMP):
             continue
         ev, miss = cost_events(side)
         if miss:
-            notes.append(f'{side}: 単価が無いモデルは 0 として数えた（{", ".join(miss)}）')
+            notes.append(f'{side}: models without a price counted as 0 ({", ".join(miss)})')
         cs_ = CostSeries(ev, t) if ev else None
         enough = bool(ev) and t - ev[0][0] >= 86400
         if not enough:
-            notes.append(f'{side}: 料金の記録が 1 日分に満たないので、使い切る確率は出さない（import か sample で溜まる）')
+            notes.append(f'{side}: less than 1 day of cost records; no exhaust probability (run import, or let sample accumulate)')
         sers = load_series(side, log)
         need = []
         for x in rs:
@@ -1036,7 +1049,7 @@ def window_states(rows, t, log=None, n=N_SAMP):
                   'rem_h': (r - t) / 3600}
             out[side][name] = st
             if st['scoped']:
-                st['note'] = 'モデルを限った枠（表示だけ、判定に使わない）'
+                st['note'] = 'model-scoped window (shown only, not used for the decision)'
                 continue
             if not enough or u >= FULL:
                 continue
@@ -1053,7 +1066,7 @@ def window_states(rows, t, log=None, n=N_SAMP):
                 s = smp[xx]
                 st['remain_usd'] = m
                 if not s:
-                    st['note'] = '料金の記録が短く、使い切る確率を出せない'
+                    st['note'] = 'cost records too short for an exhaust probability'
                     continue
                 st['X'] = sum(1 for v in s if v >= m) / len(s)
     return out, notes
@@ -1099,7 +1112,7 @@ def claude_credentials():
                            capture_output=True, text=True, timeout=10)
         if p.returncode == 0 and p.stdout.strip():
             return json.loads(p.stdout)['claudeAiOauth']
-    raise RuntimeError(f'Claude Code の資格情報が無い（{f}）')
+    raise RuntimeError(f'no Claude Code credentials ({f})')
 
 
 class RateLimited(RuntimeError):
@@ -1122,7 +1135,7 @@ def parse_claude(d, notes=None):
             wid += ':' + str(m.get('display_name') or m.get('id') or (scope.get('surface') if isinstance(scope, dict) else '') or 'scope')
         if not win:
             if notes is not None:
-                notes.append(f'Claude: 知らない種類の枠 {wid}（group={w.get("group")}）は判定に使わない')
+                notes.append(f'Claude: unknown window kind {wid} (group={w.get("group")}), not used')
             continue
         out.append({'side': 'claude', 'id': wid, 'win': win, 'u': float(w['percent']), 'r': ts(w.get('resets_at')), 'scoped': bool(scope)})
     if not out:
@@ -1139,23 +1152,23 @@ def read_claude(t, notes=None):
     import urllib.request
     cred = claude_credentials()
     if cred.get('expiresAt') and cred['expiresAt'] / 1000 < t:
-        raise RuntimeError('Claude のアクセストークンが期限切れ（Claude Code が更新するまで読めない。ここでは更新しない）')
+        raise RuntimeError('Claude access token expired (unreadable until Claude Code refreshes it; not refreshed here)')
     url = 'https://api.anthropic.com/api/oauth/usage'
     test_url = os.environ.get('CLAUDE_CODEX_ROUTER_CLAUDE_URL', '')   # テスト用。トークンを外へ送らないよう手元の偽サーバーだけ許す
     if test_url:
         if not test_url.startswith(('http://127.0.0.1:', 'http://localhost:')):
-            raise RuntimeError('CLAUDE_CODEX_ROUTER_CLAUDE_URL は http://127.0.0.1:… か http://localhost:… だけ')
+            raise RuntimeError('CLAUDE_CODEX_ROUTER_CLAUDE_URL must be http://127.0.0.1:... or http://localhost:...')
         url = test_url
     req = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + cred['accessToken'], 'anthropic-beta': 'oauth-2025-04-20'})
     try:
         d = json.load(urllib.request.urlopen(req, timeout=10))
     except urllib.error.HTTPError as e:
         if e.code == 429:
-            raise RateLimited('Claude の使用量の API が 429（呼び過ぎ）') from e
+            raise RateLimited('Claude usage API returned 429 (too many requests)') from e
         raise
     out = parse_claude(d, notes)
     if not out:
-        raise RuntimeError('Claude の使用枠が応答に無い')
+        raise RuntimeError('no Claude usage windows in the response')
     return out
 
 
@@ -1177,7 +1190,7 @@ def read_codex(t, timeout=30, notes=None):
     import subprocess
     exe = os.environ.get('CLAUDE_CODEX_ROUTER_CODEX') or shutil.which('codex')
     if not exe:
-        raise RuntimeError('codex が PATH に無い（CLAUDE_CODEX_ROUTER_CODEX で場所を渡せる）')
+        raise RuntimeError('codex not on PATH (set CLAUDE_CODEX_ROUTER_CODEX)')
     p = subprocess.Popen([exe, 'app-server'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     try:
         for m in ({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {'clientInfo': {'name': 'claude-codex-router', 'version': '0'}}},
@@ -1203,12 +1216,12 @@ def read_codex(t, timeout=30, notes=None):
                 if msg.get('id') != 2:
                     continue
                 if 'error' in msg:
-                    raise RuntimeError(f'Codex の応答がエラー: {msg["error"]}')
+                    raise RuntimeError(f'Codex returned an error: {msg["error"]}')
                 out = parse_codex((msg.get('result') or {}).get('rateLimits') or {})
                 if not out:
-                    raise RuntimeError('Codex の使用枠が応答に無い')
+                    raise RuntimeError('no Codex usage windows in the response')
                 return out
-        raise RuntimeError(f'Codex の app-server が {timeout} 秒以内に答えなかった')
+        raise RuntimeError(f'codex app-server did not answer within {timeout} s')
     finally:
         p.kill()
         p.wait()
@@ -1233,7 +1246,7 @@ def read_both(t):
             old = recent_rows('claude', t, CLAUDE_MIN_INTERVAL)
             if old:
                 rows += old
-                notes.append(f'{name}: {CLAUDE_MIN_INTERVAL:.0f} 秒以内の記録（{time.strftime("%H:%M:%S", time.localtime(old[0]["ts"]))}）を使った（API は呼ばない）')
+                notes.append(f'{name}: used the record from {time.strftime("%H:%M:%S", time.localtime(old[0]["ts"]))} (within {CLAUDE_MIN_INTERVAL:.0f} s; API not called)')
                 continue
         try:
             got = f(t, notes=notes)
@@ -1244,9 +1257,9 @@ def read_both(t):
             old = recent_rows('claude', t)
             if old:
                 rows += old
-                notes.append(f'{name}: 429 のため {time.strftime("%H:%M:%S", time.localtime(old[0]["ts"]))} の記録を使った')
+                notes.append(f'{name}: 429; used the record from {time.strftime("%H:%M:%S", time.localtime(old[0]["ts"]))}')
             else:
-                errs.append(f'{name}: {e}（{RECENT_MAX_AGE // 60} 分以内の記録も無い）')
+                errs.append(f'{name}: {e} (no record within {RECENT_MAX_AGE // 60} min either)')
         except Exception as e:   # noqa: BLE001 — 読めない理由をそのまま出す
             errs.append(f'{name}: {e}')
     return rows, errs, notes
@@ -1256,7 +1269,7 @@ def import_history():
     """この環境に在る過去の記録を取り込む（重複は足さない）。"""
     import glob
     added = sync_costs(full=True)
-    print(f'料金の記録に足した行: {added} → {COST_LOG["claude"]}・{COST_LOG["codex"]}')
+    print(f'cost rows added: {added} -> {COST_LOG["claude"]}, {COST_LOG["codex"]}')
     have = {(x['ts'], x['side'], row_id(x)) for x in read_log()}
     new = []
 
@@ -1296,21 +1309,43 @@ def import_history():
     by = {}
     for x in new:
         by[x['src']] = by.get(x['src'], 0) + 1
-    print(f'使用率の記録に足した行: {len(new)} {by} → {USAGE_LOG}')
+    print(f'usage rows added: {len(new)} {by} -> {USAGE_LOG}')
+
+
+STALE_SAMPLE = 1800   # 定期の記録（5 分おきの sample）がこれより長く止まっていれば知らせる
+
+
+def sample_note(t):
+    """定期の記録が止まっていれば注記（判断は now が料金・使用率を足すので続けられる。止まると重みの学び直しと単価の更新が遅れ、記録に穴が空く）。"""
+    try:
+        last = os.path.getmtime(SAMPLE_STAMP)
+    except OSError:
+        try:
+            if t - os.path.getmtime(VERSION_FILE) <= STALE_SAMPLE:
+                return None
+        except OSError:
+            return None                  # 入れた版ではない（リポジトリから直接）
+        return 'periodic sample (every 5 min) has never run; check the timer (README: periodic sampling)'
+    if t - last <= STALE_SAMPLE:
+        return None
+    return f'periodic sample (every 5 min) stopped {(t - last) / 3600:.1f} h ago (last {time.strftime("%m-%d %H:%M", time.localtime(last))}); check the timer (README: periodic sampling)'
 
 
 def decide_now(t, main=MAIN):
     """両方を読んで記録に足し、判断する。返り値 (結果の dict, 終了コード)。"""
     rows, errs, notes = read_both(t)
+    sn = sample_note(t)
+    if sn:
+        notes.append(sn)
     record(rows)
     try:
         sync_costs()
     except Exception as e:   # noqa: BLE001 — 料金の記録が足せなくても判断はする
-        notes.append(f'料金の記録を足せなかった: {e}')
+        notes.append(f'could not add cost records: {e}')
     states, n2 = window_states(rows, t)
     notes += n2
-    if _price_src and _price_src.startswith('取れなかった'):
-        notes.append(f'単価: {_price_src}')
+    if _price_src and _price_src.startswith('fetch failed'):
+        notes.append(f'prices: {_price_src}')
     res = {'pick': None, 'main': main, 'reason': '', 'tie': False, 'guard': [], 'full': [], 'claude_L': None, 'codex_L': None,
            'windows': {}, 'errors': errs, 'notes': notes}
     for side in states:
@@ -1320,37 +1355,37 @@ def decide_now(t, main=MAIN):
         pick, why = decide_states(states, main)
         res.update(pick=pick, tie=why['tie'], guard=why['guard'], full=why['full'], claude_L=round(why['claude_L'], 4),
                    codex_L=round(why['codex_L'], 4),
-                   reason=('満杯' if why['full'] else '歯止め' if why['guard'] or why['sub_tight'] else '差なし' if why['tie'] else '使い残す確率'))
+                   reason=('full' if why['full'] else 'guard' if why['guard'] or why['sub_tight'] else 'tie' if why['tie'] else 'leftover'))
         return res, 0
     if states['claude']:
-        res.update(pick='claude', reason='Codex が読めない')
+        res.update(pick='claude', reason='codex_unreadable')
         return res, 1
     if states['codex']:
-        res.update(pick='codex', reason='Claude が読めない')
+        res.update(pick='codex', reason='claude_unreadable')
         return res, 1
-    res.update(pick=TIE_DEFAULT, reason='どちらも読めない（既定）')
+    res.update(pick=TIE_DEFAULT, reason='both_unreadable')
     return res, 2
 
 
 def print_human(res):
     def f(x):
         return time.strftime('%m-%d %H:%M', time.localtime(x))
-    print(f'判断: {res["pick"]}（{res["reason"]}。主側 {res["main"]}）')
+    print(f'pick: {res["pick"]} (reason {res["reason"]}, main {res["main"]})')
     for e in res['errors']:
-        print('  読めなかった:', e)
+        print('  error:', e)
     for e in res['notes']:
-        print('  注記:', e)
+        print('  note:', e)
     for k, v in res['windows'].items():
         extra = ''
         if v.get('limit_usd'):
-            extra += f'  上限 ${v["limit_usd"]:,.0f}（{"今の枠の分" if v["limit_src"] == "now" else "記録の分"}）'
+            extra += f'  limit ${v["limit_usd"]:,.0f} ({"current window" if v["limit_src"] == "now" else "history"})'
         if v.get('X') is not None:
-            extra += f'  残り ${v["remain_usd"]:,.0f}・使い切る確率 {v["X"]:.2f}'
+            extra += f'  remaining ${v["remain_usd"]:,.0f}, exhaust probability {v["X"]:.2f}'
         if v.get('note'):
             extra += f'  {v["note"]}'
-        print(f'  {k}（{win_label(v["win"])}）: 使用 {v["u"]:.0f}%  リセット {f(v["r"])}（あと {v["rem_h"]:.1f} 時間）{extra}')
+        print(f'  {k} ({win_label(v["win"])}): used {v["u"]:.0f}%  resets {f(v["r"])} (in {v["rem_h"]:.1f} h){extra}')
     if res['claude_L'] is not None:
-        print(f'  使い残す確率 Claude {res["claude_L"]:.2f} / Codex {res["codex_L"]:.2f}  歯止め {res["guard"] or "なし"}  満杯 {res["full"] or "なし"}')
+        print(f'  leftover probability Claude {res["claude_L"]:.2f} / Codex {res["codex_L"]:.2f}  guard {res["guard"] or "none"}  full {res["full"] or "none"}')
 
 
 def _arg(name):
@@ -1363,11 +1398,11 @@ def main():
     if cmd == 'now':
         m = _arg('--main') or MAIN
         if m not in ('claude', 'codex'):
-            print('--main は claude か codex', file=sys.stderr)
+            print('--main must be claude or codex', file=sys.stderr)
             sys.exit(2)
         res, code = decide_now(time.time(), m)
         if '--json' in sys.argv:
-            print(json.dumps(res, ensure_ascii=False))
+            print(json.dumps(res))
         else:
             print_human(res)
         sys.exit(code)
@@ -1380,10 +1415,13 @@ def main():
         try:
             added = sync_costs(full=not os.path.exists(COST_STATE))
         except Exception as e:   # noqa: BLE001
-            added, notes = {}, notes + [f'料金の記録を足せなかった: {e}']
+            added, notes = {}, notes + [f'could not add cost records: {e}']
         re_ = maybe_calibrate(t)
-        print(f'記録した枠 {len(rows)}  料金の記録 {added}' + (f'  読めなかった: {errs}' if errs else '') + (f'  注記: {notes}' if notes else '')
-              + ('  重みを学び直した' if re_ else ''))
+        os.makedirs(DATA, exist_ok=True)
+        with open(SAMPLE_STAMP, 'w') as f:
+            f.write(f'{int(t)}\n')
+        print(f'windows recorded {len(rows)}  cost rows {added}' + (f'  errors: {errs}' if errs else '') + (f'  notes: {notes}' if notes else '')
+              + ('  weights relearned' if re_ else ''))
         sys.exit(0 if rows else 1)
     if cmd == 'calibrate':
         calibrate()
@@ -1391,7 +1429,7 @@ def main():
     if cmd == 'import':
         import_history()
         return
-    print(__doc__)
+    print(USAGE)
     sys.exit(0 if cmd in ('', '-h', '--help', 'help') else 2)
 
 

@@ -38,13 +38,15 @@ class TempDirCase(unittest.TestCase):
     def setUp(self):
         self.d = tempfile.mkdtemp()
         self.saved = {k: getattr(route, k) for k in ('DATA', 'USAGE_LOG', 'COST_LOG', 'COST_STATE', 'PRICE_FILE', 'WEIGHTS_FILE',
-                                                     'CLAUDE_HOME', 'CODEX_HOME', '_prices', 'CONFIG')}
+                                                     'CLAUDE_HOME', 'CODEX_HOME', '_prices', 'CONFIG', 'SAMPLE_STAMP', 'VERSION_FILE')}
         route.DATA = os.path.join(self.d, 'data')
         route.USAGE_LOG = os.path.join(route.DATA, 'usage.jsonl')
         route.COST_LOG = {s: os.path.join(route.DATA, f'cost-{s}.jsonl') for s in ('claude', 'codex')}
         route.COST_STATE = os.path.join(route.DATA, 'cost-state.json')
         route.PRICE_FILE = os.path.join(route.DATA, 'litellm-prices.json')
         route.WEIGHTS_FILE = os.path.join(route.DATA, 'weights.json')
+        route.SAMPLE_STAMP = os.path.join(route.DATA, 'last-sample')
+        route.VERSION_FILE = os.path.join(self.d, '.version')
         route.CLAUDE_HOME, route.CODEX_HOME = os.path.join(self.d, 'claude'), os.path.join(self.d, 'codex')
         route._prices = dict(PRICES)
         route.CONFIG = dict(route.CONFIG, prices={})
@@ -109,7 +111,7 @@ class PriceTests(TempDirCase):
         finally:
             route.PRICE_URL = saved
         self.assertIn('claude-opus-5-5', d)
-        self.assertTrue(route._price_src.startswith('取れなかった'))
+        self.assertTrue(route._price_src.startswith('fetch failed'))
 
     def test_fetch_writes_the_cache(self):
         route._prices = None
@@ -422,7 +424,22 @@ class WindowStateTests(TempDirCase):
         self.write_costs('claude', [{'k': 'a', 'ts': t - H, 'model': 'claude-opus-5-5', 'out': 1000}])
         states, notes = route.window_states([{'side': 'claude', 'id': 'weekly_all', 'win': 10080, 'u': 45.0, 'r': int(t + D)}], t, log=[])
         self.assertIsNone(states['claude']['claude-weekly_all']['X'])
-        self.assertIn('1 日分', notes[0])
+        self.assertIn('less than 1 day', notes[0])
+
+
+class SampleNoteTests(TempDirCase):
+    def test_tells_when_the_timer_stopped(self):
+        t = time.time()
+        self.assertIsNone(route.sample_note(t))                          # 入れた版ではない（.version が無い）
+        open(route.VERSION_FILE, 'w').close()
+        os.utime(route.VERSION_FILE, (t - 7200, t - 7200))
+        self.assertIn('never run', route.sample_note(t))                    # 入れて 2 時間、sample が一度も動いていない
+        os.makedirs(route.DATA)
+        open(route.SAMPLE_STAMP, 'w').close()
+        os.utime(route.SAMPLE_STAMP, (t - 600, t - 600))
+        self.assertIsNone(route.sample_note(t))                          # 10 分前に動いた
+        os.utime(route.SAMPLE_STAMP, (t - 3 * 3600, t - 3 * 3600))
+        self.assertIn('stopped 3.0 h ago', route.sample_note(t))
 
 
 class RecordTests(TempDirCase):
@@ -455,7 +472,7 @@ class RecordTests(TempDirCase):
         rows, errs, notes, calls = self._read_both_counting(t)
         self.assertEqual(calls, [])
         self.assertEqual([x['u'] for x in rows if x['side'] == 'claude'], [12.0])
-        self.assertIn('呼ばない', notes[0])
+        self.assertIn('API not called', notes[0])
         route.record(rows)                                   # 借りた行は記録に足さない
         self.assertEqual(sum(1 for x in route.read_log() if x['side'] == 'claude'), 1)
 

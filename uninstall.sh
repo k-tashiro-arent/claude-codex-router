@@ -16,6 +16,11 @@ if [[ -f "$unit_dir/$NAME-sample.timer" ]]; then
   systemctl --user daemon-reload >/dev/null 2>&1 || true
   echo "  systemd のタイマーを外した"
 fi
+# linger（このインストーラが有効にしたときだけ戻す。ほかの用途で有効にしていたものは触らない）
+if [[ -f "$DIR/.linger" ]]; then
+  loginctl disable-linger "$(id -un)" >/dev/null 2>&1 && echo "  linger を戻した（無効に）" || echo "  linger を戻せなかった。手で: loginctl disable-linger $(id -un)"
+  rm -f "$DIR/.linger"
+fi
 # launchd
 plist="$HOME/Library/LaunchAgents/$LABEL.plist"
 if [[ -f "$plist" ]]; then

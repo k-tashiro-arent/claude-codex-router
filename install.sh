@@ -7,6 +7,8 @@
 #   3) 既定の config.json を配置（既存は上書きしない）
 #   4) 5 分おきに `router.py sample` を呼ぶタイマーを置く
 #        systemd のユーザータイマー → macOS の launchd → crontab の順に、使えるものを 1 つ
+#        systemd では linger を有効にする（ログインしていなくても、起動時にユーザーの systemd が立ち上がりタイマーが動く。
+#        WSL の再起動のあとも止まらない）。有効にしたのがこのインストーラなら、uninstall.sh で戻す
 #        CLAUDE_CODEX_ROUTER_SCHEDULER=systemd|launchd|cron|none で選べる（none は置かない）
 #   5) uninstall.sh を配置、版数を記録
 # 使用量の記録（data/）は上書きしない。
@@ -58,7 +60,8 @@ path_dirs="/usr/local/bin:/usr/bin:/bin"
 [[ -n "$CODEX" ]] && path_dirs="$(dirname "$CODEX"):$path_dirs"
 
 if [[ "$SCHED" == "auto" ]]; then
-  if command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+  # ユーザーの systemd が今動いているかでは決めない（WSL の再起動のあとなど、linger が無いと動いていない）。PID 1 が systemd かで決める
+  if command -v systemctl >/dev/null 2>&1 && [[ "$(cat /proc/1/comm 2>/dev/null)" == "systemd" ]]; then
     SCHED=systemd
   elif [[ "$(uname -s)" == "Darwin" ]]; then
     SCHED=launchd
@@ -72,6 +75,22 @@ fi
 
 case "$SCHED" in
   systemd)
+    me="$(id -un)"
+    export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    if command -v loginctl >/dev/null 2>&1 && [[ "$(loginctl show-user "$me" -p Linger --value 2>/dev/null)" != "yes" ]]; then
+      if loginctl enable-linger "$me" >/dev/null 2>&1; then
+        : > "$DIR/.linger"   # このインストーラが有効にした（uninstall.sh が戻す）
+        echo "  linger : 有効にした（起動時にユーザーの systemd が立ち上がる）"
+      else
+        echo "  WARNING: linger を有効にできない。再起動のあと、ログインするまでタイマーが動きません。"
+        echo "           手で: loginctl enable-linger $me   （だめなら sudo loginctl enable-linger $me）"
+      fi
+    fi
+    # linger を有効にした直後は、ユーザーの systemd が立ち上がるまで少し待つ
+    for _ in $(seq 20); do
+      systemctl --user show-environment >/dev/null 2>&1 && break
+      sleep 0.5
+    done
     unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
     mkdir -p "$unit_dir"
     cat > "$unit_dir/$NAME-sample.service" <<EOF
@@ -96,9 +115,12 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF
-    systemctl --user daemon-reload
-    systemctl --user enable --now "$NAME-sample.timer" >/dev/null
-    echo "  timer  : systemd（$unit_dir/$NAME-sample.timer）"
+    if systemctl --user daemon-reload >/dev/null 2>&1 && systemctl --user enable --now "$NAME-sample.timer" >/dev/null 2>&1; then
+      echo "  timer  : systemd（$unit_dir/$NAME-sample.timer）"
+    else
+      echo "  WARNING: ユーザーの systemd に繋がらず、タイマーを登録できない（定義は $unit_dir に置いた）。"
+      echo "           ログインした端末で: systemctl --user daemon-reload && systemctl --user enable --now $NAME-sample.timer"
+    fi
     ;;
   launchd)
     agent_dir="$HOME/Library/LaunchAgents"

@@ -129,7 +129,7 @@ assert w['codex-7d']['u'] == 30 and w['claude-weekly_all']['u'] == 20 and w['cla
 assert w['claude-weekly_scoped:Fable']['scoped'] and not w['claude-weekly_all']['scoped']
 assert all(v['X'] is None for v in w.values())                      # 料金の記録が 1 日分に満たない（初めての環境）
 assert d['claude_L'] == 0.5 and d['codex_L'] == 0.5 and not d['errors']
-assert any('1 日分' in n for n in d['notes']), d['notes']
+assert any('less than 1 day' in n for n in d['notes']), d['notes']
 EOF
 [[ "$(wc -l < "$DIR/data/usage.jsonl")" -eq 4 ]] || fail "記録が 4 行でない"
 out=$(python3 "$DIR/bin/router.py" now --json --main codex) || true
@@ -141,14 +141,14 @@ pass "now：両方を読んで判断し、記録した"
 set +e
 out=$(CLAUDE_CODEX_ROUTER_CODEX=/nonexistent PATH="/usr/bin:/bin" python3 "$DIR/bin/router.py" now --json); code=$?
 set -e
-if [[ $code != 1 ]] || ! python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["pick"]=="claude" and d["errors"]' "$out"; then
+if [[ $code != 1 ]] || ! python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["pick"]=="claude" and d["reason"]=="codex_unreadable" and d["errors"]' "$out"; then
   fail "Codex が読めないとき（終了コード $code、$out）"
 fi
 mv "$CLAUDE_CONFIG_DIR/.credentials.json" "$work/cred.bak"
 set +e
 out=$(CLAUDE_CODEX_ROUTER_CODEX=/nonexistent PATH="/usr/bin:/bin" python3 "$DIR/bin/router.py" now --json); code=$?
 set -e
-if [[ $code != 2 ]] || ! python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["pick"]=="codex" and len(d["errors"])==2' "$out"; then
+if [[ $code != 2 ]] || ! python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["pick"]=="codex" and d["reason"]=="both_unreadable" and len(d["errors"])==2' "$out"; then
   fail "どちらも読めないとき（終了コード $code、$out）"
 fi
 mv "$work/cred.bak" "$CLAUDE_CONFIG_DIR/.credentials.json"
@@ -189,7 +189,7 @@ n0=$(wc -l < "$DIR/data/usage.jsonl")
 set +e
 out=$(python3 "$DIR/bin/router.py" now --json); code=$?
 set -e
-if [[ $code != 0 ]] || ! python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert not d["errors"] and "呼ばない" in d["notes"][0] and d["windows"]["claude-weekly_all"]["u"]==33' "$out"; then
+if [[ $code != 0 ]] || ! python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert not d["errors"] and "API not called" in d["notes"][0] and d["windows"]["claude-weekly_all"]["u"]==33' "$out"; then
   fail "直近の記録があるとき（終了コード $code、$out）"
 fi
 python3 "$DIR/bin/router.py" sample > /dev/null || fail "直近の記録があるときの sample"
@@ -207,4 +207,45 @@ grep -q '# claude-codex-router$' "$work/crontab.txt" && fail "アンインスト
 [[ -f "$DIR/bin/router.py" ]] && fail "アンインストール後も router.py が残る"
 [[ -f "$DIR/data/usage.jsonl" && -f "$DIR/config.json" ]] || fail "アンインストールで記録・設定が消えた"
 pass "uninstall：タイマーと本体を外し、記録と設定は残した"
+# 9) systemd：linger を有効にし、ユーザーの systemd に繋がらなくても入れ終わる（WSL の再起動のあとの状態）
+cat > "$work/bin/loginctl" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$work/loginctl.log"
+if [[ "\$1" == show-user ]]; then [[ -f "$work/lingering" ]] && echo yes || echo no; fi
+if [[ "\$1" == enable-linger ]]; then : > "$work/lingering"; fi
+if [[ "\$1" == disable-linger ]]; then rm -f "$work/lingering"; fi
+exit 0
+EOF
+cat > "$work/bin/systemctl" <<EOF
+#!/usr/bin/env bash
+echo "\$*" >> "$work/systemctl.log"
+[[ -f "$work/systemd-up" ]]
+EOF
+chmod +x "$work/bin/loginctl" "$work/bin/systemctl"
+CLAUDE_CODEX_ROUTER_SCHEDULER=systemd bash "$SRC/install.sh" > "$work/install-systemd.log" || fail "systemd に繋がらないと install が止まる"
+[[ -f "$DIR/.version" && -f "$DIR/uninstall.sh" ]] || fail "systemd に繋がらないとき、最後まで入れ終わらない"
+grep -q '^enable-linger ' "$work/loginctl.log" && [[ -f "$DIR/.linger" ]] || fail "linger を有効にしていない／印が無い"
+grep -q 'タイマーを登録できない' "$work/install-systemd.log" || fail "タイマーを登録できないことを知らせていない"
+[[ -f "$HOME/.config/systemd/user/claude-codex-router-sample.timer" ]] || fail "タイマーの定義が無い"
+: > "$work/systemd-up"
+: > "$work/loginctl.log"
+CLAUDE_CODEX_ROUTER_SCHEDULER=systemd bash "$SRC/install.sh" > "$work/install-systemd.log" || fail "systemd の再インストール"
+grep -q '^enable-linger ' "$work/loginctl.log" && fail "linger が有効なのに有効にし直した"
+grep -q 'enable --now claude-codex-router-sample.timer' "$work/systemctl.log" || fail "タイマーを有効にしていない"
+bash "$DIR/uninstall.sh" > /dev/null
+grep -q '^disable-linger ' "$work/loginctl.log" && [[ ! -f "$DIR/.linger" ]] || fail "uninstall で linger を戻していない"
+[[ ! -f "$HOME/.config/systemd/user/claude-codex-router-sample.timer" ]] || fail "uninstall でタイマーの定義が残る"
+pass "systemd：linger を有効にし、systemd に繋がらなくても入れ終わる。uninstall で戻す"
+
+# 10) 定期の記録が止まっていれば now が知らせる
+bash "$SRC/install.sh" > /dev/null
+python3 "$DIR/bin/router.py" sample > /dev/null || true
+touch -d '-2 hours' "$DIR/data/last-sample"
+out=$(python3 "$DIR/bin/router.py" now --json) || true
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert any("stopped" in n for n in d["notes"]), d["notes"]' "$out" || fail "定期の記録が止まっていることを知らせない"
+python3 "$DIR/bin/router.py" sample > /dev/null || true
+out=$(python3 "$DIR/bin/router.py" now --json) || true
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert not any("stopped" in n for n in d["notes"]), d["notes"]' "$out" || fail "定期の記録が動いているのに知らせた"
+bash "$DIR/uninstall.sh" > /dev/null
+pass "定期の記録が止まっていれば now が知らせる"
 echo "smoke: all passed"

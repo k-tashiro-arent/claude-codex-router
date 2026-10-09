@@ -94,11 +94,20 @@ cd claude-codex-router
 1. `router.py` と、混ぜる割合の既定（`weights-default.json`）を `~/.claude/codex-router/` に置く（`CLAUDE_CODEX_ROUTER_DIR` で変更可）。
 2. 既定の `config.json` を置く（既にあれば上書きしない）。
 3. 5 分おきに使用量を記録するタイマーを置く。使えるものを次の順で 1 つ選びます（`CLAUDE_CODEX_ROUTER_SCHEDULER=systemd|launchd|cron|none` で指定可）。
-   - systemd のユーザータイマー（`claude-codex-router-sample.timer`）
+   - systemd のユーザータイマー（`claude-codex-router-sample.timer`）。linger も有効にします（下の「定期の記録」）
    - macOS の launchd（`~/Library/LaunchAgents/io.github.k-tashiro-arent.claude-codex-router.plist`）
    - crontab（`# claude-codex-router` の印の付いた 1 行）
 
 タイマーから `codex` を見つけられるよう、インストール時の `codex` の場所を PATH に書き込みます。`codex` を入れ直した・node の版を変えたときは、`install.sh` を再実行してください。
+
+### 定期の記録
+
+- systemd では、インストーラが **linger を有効にします**（`loginctl enable-linger`）。linger が無いと、ユーザーの systemd はログインしたときにしか立ち上がりません。WSL を再起動したあと、ログインせずに Claude Code などを動かしている間は、タイマーが動かないままになります。
+  - linger を有効にしたのがインストーラなら、`uninstall.sh` が無効に戻します。前から有効だったときは触りません。
+  - 有効にできなかったとき・ユーザーの systemd に繋がらなかったときも、インストールは最後まで行い、手で打つコマンドを表示します。
+- WSL（やマシン）が止まっている間は、何も記録されません。起動したあと、止まっていた間の分としてタイマーが 1 回だけ動きます。
+- `now` は、呼ばれるたびに使用率と料金を記録に足します。そのため、タイマーが止まっていても判断は続けられます。ただし、混ぜる割合の学び直し・単価の更新が遅れ、使用率の記録に穴が空きます。タイマーが 30 分を超えて止まっていると、`now` の `notes` に書きます。
+- 確かめるには：`systemctl --user list-timers | grep codex`（systemd）、または `~/.claude/codex-router/data/last-sample` の時刻（最後に `sample` が動いた時刻）を見ます。
 
 過去の記録を取り込むと、すぐに自分の記録で判断できます。
 ```bash
@@ -120,13 +129,14 @@ python3 ~/.claude/codex-router/bin/router.py import   # 会話ログの料金・
 
 `now --json` の形（値は例。`windows` は枠ごと）：
 ```json
-{"pick": "claude", "main": "claude", "reason": "使い残す確率", "tie": false, "guard": [], "full": [],
+{"pick": "claude", "main": "claude", "reason": "leftover", "tie": false, "guard": [], "full": [],
  "claude_L": 0.515, "codex_L": 0.28,
  "windows": {"claude-session": {"u": 12.0, "r": 1791479400, "win": 300, "scoped": false, "X": 0.0,
                                 "limit_usd": 131.15, "limit_src": "now", "remain_usd": 115.41, "rem_h": 3.01}, "...": {}},
  "errors": [], "notes": []}
 ```
-`reason` は `満杯`・`歯止め`・`差なし`・`使い残す確率`・`Codex が読めない`・`Claude が読めない`・`どちらも読めない（既定）` のどれかです。
+`reason` は次のどれかです：`full`（満杯）・`guard`（歯止め）・`tie`（差なし）・`leftover`（使い残す確率の比較）・`codex_unreadable`（Codex が読めない）・`claude_unreadable`（Claude が読めない）・`both_unreadable`（どちらも読めない。`tie_default` を返す）。
+判定器の出力（`now`・`sample` などの表示、`errors`・`notes`・`note` の文）は英語です。
 `limit_src` は上限の出し方（`now` 今の枠の分／`hist` 記録の分）です。
 
 ## 設定
