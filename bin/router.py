@@ -1,55 +1,55 @@
 #!/usr/bin/env python3
-"""claude-codex-router：仕事を Claude と Codex のどちらに回すかを、両方の使用枠の余裕から決める。
+"""claude-codex-router: decides whether to send work to Claude or Codex, from the headroom of both usage windows.
 
-主側（main）と移譲先：主に使う側を --main claude|codex（または config の main、既定 claude）で決める。もう片側が移譲先。
+Main side and sub side: the side used mainly is set by --main claude|codex (or main in config, default claude). The other side is the sub side.
 
-枠：API が返す枠をすべて扱う（数・長さ・上限は変わる前提）。
-  Claude：使用量 API の limits の各枠（session＝5 時間、weekly＝7 日。知らない種類は判定に使わず注記）。
-          モデルを限った枠（scope のある枠）は表示だけで、判定には使わない。
-  Codex ：rateLimits の primary・secondary（長さは API が返す）。
+Windows: every window the API returns is handled (their number, length and limit are assumed to change).
+  Claude: each window in limits of the usage API (session = 5 hours, weekly = 7 days; unknown kinds are not used for the decision and get a note).
+          Model-scoped windows (windows with a scope) are shown only, not used for the decision.
+  Codex : primary and secondary of rateLimits (the API returns the length).
 
-使用量は料金（USD）で数える：会話ログのトークン数 × モデル別単価。
-  単価は動作時に LiteLLM の単価データから取り、<DIR>/data/litellm-prices.json に控える（1 日より古ければ sample が取り直す。
-  取れないときは控え）。config の prices でモデルごとに上書きできる。単価の無いモデルは 0 として数え、注記する。
-  料金の記録：<DIR>/data/cost-claude.jsonl・cost-codex.jsonl（会話ログは消えることがあるので、読んだ分を写して溜める）。
-  ほかの端末・claude.ai で使った分は入らない。
+Usage is counted in cost (USD): token counts in the conversation logs × per-model price.
+  Prices are taken at run time from LiteLLM's price data and cached in <DIR>/data/litellm-prices.json (sample refetches it when older than 1 day;
+  when it cannot be fetched, the cache is used). prices in config can override them per model. Models without a price count as 0, with a note.
+  Cost records: <DIR>/data/cost-claude.jsonl and cost-codex.jsonl (conversation logs can disappear, so what has been read is copied and accumulated).
+  Use on other machines or on claude.ai is not included.
 
-上限の金額（枠ごとに実行時に推定）：
-  使用率 u が LIMIT_NOW_U（10%）以上なら、今の枠の分：100 × 枠の始まり（リセット − 枠の長さ）から今までの料金 ÷ u。
-  それ未満なら、記録の分：直前を 1 時間ずつさかのぼり、使用率の伸びがその枠 1 つ分（100%）になるまでの料金 ÷ 使用率の伸び
-  （上限に達していた時間と、使用率の記録が始まる前は除く。28 日まで。伸びが 20% に満たなければ使わない）。それも無ければ今の枠の分。
-使い切る確率 X（その枠の次のリセットまでに上限に達する確率）＝ P(S ≥ 上限 × (1 − u/100))。
-  S は今からリセットまでに使う料金の分布。過去の料金の列（15 分ごと）から標本で作る：
-    24 時間先までは wpool：似た時点のその後（knn）・同じ時刻の実績（最近ほど重く）・使うか × いくら（hurdle）・
-      同じ時刻の実績を直前 7 日／3 日の水準で割り戻したもの・日の合計の指数平滑を時刻で割り振ったもの を、x ごとに学んだ重みで混ぜる。
-      重みは calibrate が記録から学ぶ（<DIR>/data/weights.json）。無いあいだは同梱の重み（<DIR>/weights-default.json）。
-    それより先は pool2：knn・7 日の水準で割り戻したもの・日の合計の指数平滑 を同じ割合で混ぜる。
-  休日：土日と config の holidays（"YYYY-MM-DD" の一覧）。
-  料金の記録が 1 日分に満たない側は X を出さない（判定ではその枠を見ない）。
+Limit amount (estimated per window at run time):
+  If usage u is LIMIT_NOW_U (10%) or more, from the current window: 100 × cost from the window start (reset − window length) until now ÷ u.
+  Below that, from history: going back 1 hour at a time from just before now, cost until the usage growth reaches one window's worth (100%) ÷ usage growth
+  (excluding time spent at the limit and time before the usage records start; up to 28 days; not used if the growth is under 20%). If that is unavailable too, from the current window.
+Exhaust probability X (probability of reaching the limit before the window's next reset) = P(S ≥ limit × (1 − u/100)).
+  S is the distribution of the cost used from now until the reset. It is built as samples from the past cost series (every 15 minutes):
+    Up to 24 hours ahead, wpool: what followed similar points in time (knn), actuals at the same time of day (more recent weighs more), whether used × how much (hurdle),
+      actuals at the same time of day rescaled by the level of the previous 7 days / 3 days, and exponential smoothing of daily totals spread by time of day, mixed with weights learned per x.
+      calibrate learns the weights from the records (<DIR>/data/weights.json). Until then, the bundled weights (<DIR>/weights-default.json).
+    Beyond that, pool2: knn, the rescaling by the 7-day level, and exponential smoothing of daily totals, mixed in equal shares.
+  Holidays: Saturdays, Sundays and holidays in config (a list of "YYYY-MM-DD").
+  A side with no cost records at all gets no X (the decision does not look at its windows). Even if the records are short, the forecast uses what there is.
 
-判断（先の段で決まれば後の段は見ない）：
-  1. 上限：片側だけがどれかの枠で上限（config の full、既定 98%）に達していれば、もう片側。両側なら次へ。
-  2. 歯止め：主側のどれかの枠の X が config の guard_risk（既定 0.5）を超えるなら移譲先。
-     主側が上限に達すると、それを使って作業を回している側も止まる。移譲先が上限でも主側に戻せば作業は続く。
-     移譲先の短い枠（1 日未満）の X が guard_risk を超えるなら主側。
-  3. 比較：長い枠（1 日以上）の、リセットまでに使い切らない確率 1 − X（使い残す確率）の、各側の最小の大きい側。
-     等しければ config の tie_default（既定 codex）。
+Decision (once a stage decides, later stages are not looked at):
+  1. Full: if only one side has reached the limit (full in config, default 98%) in some window, the other side. If both have, go on.
+  2. Guard: if X of any main-side window exceeds guard_risk in config (default 0.5), the sub side.
+     When the main side reaches its limit, the side that drives the work with it stops too. If the sub side is at its limit, work continues by returning to the main side.
+     If X of a short window (under 1 day) of the sub side exceeds guard_risk, the main side.
+  3. Compare: for long windows (1 day or more), the probability of not using the window up before the reset, 1 − X (leftover probability); the side whose minimum is larger.
+     If equal, tie_default in config (default codex).
 
-使用率の記録（各環境で自前で溜める）：
-  <DIR>/data/usage.jsonl。1 行 = 1 枠の 1 回の読み {"ts", "side", "id": 枠の種類, "win": 枠の長さ(分), "u": 使用率, "r": リセット時刻,
-  "scoped": モデルを限った枠か, "src"}。id の無い古い行は長さから決める（Claude 300→session・10080→weekly_all、Codex は長さ）。
-  DIR は環境変数 CLAUDE_CODEX_ROUTER_DIR（既定 ~/.claude/codex-router）。
-  読み方（どちらもモデルを呼ばないので枠は減らない）：
-    Claude：GET https://api.anthropic.com/api/oauth/usage（Claude Code の /usage と同じ。公開文書に無い）。
-            トークンは $CLAUDE_CONFIG_DIR（既定 ~/.claude）/.credentials.json を読むだけで更新しない。
-            macOS で Keychain に保管されている場合は security コマンドで読む（試験的な対応）。
-    Codex ：codex app-server（stdio の JSON-RPC。試験中の機能）の account/rateLimits/read。
+Usage records (each environment accumulates its own):
+  <DIR>/data/usage.jsonl. 1 line = 1 read of 1 window {"ts", "side", "id": window kind, "win": window length (min), "u": usage, "r": reset time,
+  "scoped": whether the window is model-scoped, "src"}. For old lines without id, it is derived from the length (Claude 300→session, 10080→weekly_all; Codex by the length).
+  DIR is the environment variable CLAUDE_CODEX_ROUTER_DIR (default ~/.claude/codex-router).
+  How they are read (neither calls a model, so the windows are not used up):
+    Claude: GET https://api.anthropic.com/api/oauth/usage (same as /usage in Claude Code; not publicly documented).
+            The token is only read from $CLAUDE_CONFIG_DIR (default ~/.claude)/.credentials.json and never refreshed.
+            On macOS, when it is stored in the Keychain, it is read with the security command (experimental support).
+    Codex : GET https://chatgpt.com/backend-api/wham/usage (the endpoint written in the Codex CLI executable; not publicly documented).
+            The token is only read from $CODEX_HOME (default ~/.codex)/auth.json and never refreshed.
 
-使い方：
-  router.py now [--json] [--main claude|codex]   今の判断（両方を読んで記録にも足す）。終了コード 0=両方読めた 1=片側だけ 2=どちらも読めない
-  router.py sample      両方を読んで記録に足し、料金の記録を会話ログから足す（install.sh が置くタイマーが 5 分おきに呼ぶ）
-  router.py calibrate   料金の記録から wpool の重みを学び直す（sample が 1 日 1 回呼ぶ）
-  router.py import      この環境に在る過去の記録を取り込む（会話ログの料金・~/.codex/sessions の使用率・claude-token-pace の記録。重複は足さない）
+Usage:
+  router.py now [--json] [--main claude|codex]   decide now (reads both and also adds them to the records). Exit code 0=both read 1=one side only 2=neither read
+  router.py sample      reads both and adds them to the records; adds cost records from the conversation logs (the timer install.sh sets up calls it every 5 minutes)
+  router.py calibrate   relearns the wpool weights from the cost records (sample calls it once a day)
 """
 import bisect
 import datetime
@@ -65,14 +65,16 @@ USAGE = """claude-codex-router: pick Claude or Codex for the next task from the 
 usage:
   router.py now [--json] [--main claude|codex]  decide now (reads both, also records). exit 0=both read 1=one side 2=neither
   router.py sample      read both and record; add cost rows from the conversation logs (the timer calls this every 5 min)
-  router.py calibrate   relearn the mixing weights from the cost records (sample calls this once a day)
-  router.py import      import past records on this machine (conversation-log costs, ~/.codex/sessions usage, claude-token-pace; no duplicates)
+  router.py calibrate [--if-needed]  relearn the mixing weights from the cost records (sample calls this once a day;
+                        --if-needed: only when the weights are missing, older than a day, or learned with other parts)
 
-now --json fields: pick, main, reason (full|guard|tie|leftover|codex_unreadable|claude_unreadable|both_unreadable), tie, guard, full,
+now --json fields: pick, main, reason (full|guard|tie|leftover|codex_unreadable|claude_unreadable|both_unreadable), tie,
+  guard (main-side windows over guard_risk, when they sent the pick to the sub side),
+  sub_tight (sub-side short windows over guard_risk, when they kept the pick on main), full (all windows at full),
   claude_L, codex_L, windows, errors, notes. Data and settings: $CLAUDE_CODEX_ROUTER_DIR (default ~/.claude/codex-router)."""
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-REPO_DEFAULTS = os.path.join(os.path.dirname(HERE), 'defaults')   # リポジトリから直接動かすとき
+REPO_DEFAULTS = os.path.join(os.path.dirname(HERE), 'defaults')   # when run directly from the repository
 DIR = os.path.expanduser(os.environ.get('CLAUDE_CODEX_ROUTER_DIR') or '~/.claude/codex-router')
 DATA = os.path.join(DIR, 'data')
 USAGE_LOG = os.path.join(DATA, 'usage.jsonl')
@@ -80,17 +82,17 @@ COST_LOG = {'claude': os.path.join(DATA, 'cost-claude.jsonl'), 'codex': os.path.
 COST_STATE = os.path.join(DATA, 'cost-state.json')
 PRICE_FILE = os.path.join(DATA, 'litellm-prices.json')
 WEIGHTS_FILE = os.path.join(DATA, 'weights.json')
-SAMPLE_STAMP = os.path.join(DATA, 'last-sample')   # sample が最後に動いた時刻（定期の記録が止まっていないかの確かめ）
-VERSION_FILE = os.path.join(DIR, '.version')       # 入れた時刻の代わり（sample がまだ一度も動いていないとき）
-TP = os.path.expanduser(os.environ.get('TOKEN_PACE_DIR') or '~/.claude/token-pace') + '/'   # import の取り込み元（在れば）
+SAMPLE_STAMP = os.path.join(DATA, 'last-sample')   # when sample last ran (to check that periodic sampling has not stopped)
+VERSION_FILE = os.path.join(DIR, '.version')       # stands in for the install time (when sample has never run yet)
+TP = os.path.expanduser(os.environ.get('TOKEN_PACE_DIR') or '~/.claude/token-pace') + '/'   # claude-token-pace records (added to the usage records if found)
 CLAUDE_HOME = os.path.expanduser(os.environ.get('CLAUDE_CONFIG_DIR') or '~/.claude')
 CODEX_HOME = os.path.expanduser(os.environ.get('CODEX_HOME') or '~/.codex')
-PRICE_URL = (os.environ.get('CLAUDE_CODEX_ROUTER_PRICE_URL')   # テスト用（file:// も可）
+PRICE_URL = (os.environ.get('CLAUDE_CODEX_ROUTER_PRICE_URL')   # for tests (file:// also works)
              or 'https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json')
 
 
 def _conf(name):
-    """<DIR>/name、無ければリポジトリの defaults/name。"""
+    """<DIR>/name, or the repository's defaults/name if it is missing."""
     for d in (DIR, REPO_DEFAULTS):
         f = os.path.join(d, name)
         if os.path.exists(f):
@@ -108,27 +110,27 @@ def _load_json(name):
 CONFIG = {'main': 'claude', 'guard_risk': 0.5, 'tie_default': 'codex', 'full': 98.0, 'claude_min_interval': 60,
           'holidays': [], 'prices': {}, **_load_json('config.json')}
 MAIN = CONFIG['main'] if CONFIG['main'] in ('claude', 'codex') else 'claude'
-GUARD_RISK = float(CONFIG['guard_risk'])     # 歯止め：主側の使い切る確率がこれを超えるなら移譲先に回す
-FULL = float(CONFIG['full'])                 # これ以上はその側を使えないとみなす
-try:   # この秒数以内に読んだ Claude の記録があれば API を呼ばずにそれを使う（続けて呼ぶと 429 になる）。0 以下で無効
+GUARD_RISK = float(CONFIG['guard_risk'])     # guard: if the main side's exhaust probability exceeds this, send to the sub side
+FULL = float(CONFIG['full'])                 # at or above this, the side is treated as unusable
+try:   # if a Claude record read within this many seconds exists, use it without calling the API (calling repeatedly gives 429). 0 or less disables this
     CLAUDE_MIN_INTERVAL = float(CONFIG['claude_min_interval'])
 except (TypeError, ValueError):
     CLAUDE_MIN_INTERVAL = 60.0
-RECENT_MAX_AGE = 600   # 429 のとき代わりに使う記録の古さの上限（秒）。記録は 5 分おきなので 2 回分
+RECENT_MAX_AGE = 600   # max age (s) of the record used instead on 429. Records are every 5 minutes, so this is 2 records' worth
 TIE_DEFAULT = CONFIG['tie_default'] if CONFIG['tie_default'] in ('claude', 'codex') else 'codex'
 HOLIDAYS = frozenset(str(x) for x in (CONFIG.get('holidays') or []))
-LONG_WIN = 1440      # この長さ（分）以上の枠を「長い枠」（比較に使う）、未満を「短い枠」とする
-LIMIT_NOW_U = 10.0   # 使用率がこれ以上なら上限を今の枠の分で出す
-CLAUDE_KIND_WIN = {'session': 300, 'weekly': 10080}   # Claude の枠の group → 長さ（分）
+LONG_WIN = 1440      # windows of this length (min) or more are "long windows" (used for the comparison), shorter ones are "short windows"
+LIMIT_NOW_U = 10.0   # if usage is at least this, the limit is estimated from the current window
+CLAUDE_KIND_WIN = {'session': 300, 'weekly': 10080}   # Claude window group → length (min)
 
 
-# ---- 単価（LiteLLM） ----
+# ---- prices (LiteLLM) ----
 _prices = None
 _price_src = None
 
 
 def fetch_prices(timeout=30):
-    """LiteLLM の単価データを取り、控えに書く。返り値は単価データ。"""
+    """Fetch LiteLLM's price data and write the cache. Returns the price data."""
     import urllib.request
     with urllib.request.urlopen(PRICE_URL, timeout=timeout) as r:
         d = json.load(r)
@@ -142,7 +144,7 @@ def fetch_prices(timeout=30):
 
 
 def load_prices(refresh=False):
-    """単価データ。refresh で 1 日より古い控えを取り直す。控えが無ければ取りに行く。取れなければ控え（無ければ空）。"""
+    """Price data. With refresh, refetch a cache older than 1 day. Fetch it if there is no cache. If fetching fails, the cache (empty if none)."""
     global _prices, _price_src
     if _prices is not None and not refresh:
         return _prices
@@ -151,7 +153,7 @@ def load_prices(refresh=False):
         try:
             _prices, _price_src = fetch_prices(), 'fetched'
             return _prices
-        except Exception as e:   # noqa: BLE001 — 取れなければ控えを使う
+        except Exception as e:   # noqa: BLE001 — use the cache if fetching fails
             _price_src = f'fetch failed ({e})'
     try:
         _prices = json.load(open(PRICE_FILE))
@@ -162,7 +164,7 @@ def load_prices(refresh=False):
 
 
 def price(model):
-    """100 万トークンあたり USD の dict（in・out・cw5m・cw1h・cr）。config の prices が先。見つからなければ None。"""
+    """dict of USD per 1M tokens (in, out, cw5m, cw1h, cr). prices in config take precedence. None if not found."""
     ov = (CONFIG.get('prices') or {}).get(model or '')
     d = load_prices()
     e = None
@@ -182,11 +184,15 @@ def price(model):
                'cw1h': g('cache_creation_input_token_cost_above_1hr', cw if cw is not None else inp) * 1e6,
                'cr': g('cache_read_input_token_cost', inp) * 1e6}
     out.update({k: float(v) for k, v in (ov or {}).items() if k in ('in', 'out', 'cw5m', 'cw1h', 'cr')})
-    return out if 'in' in out else None
+    if 'in' not in out:
+        return None
+    for k in ('out', 'cw5m', 'cw1h', 'cr'):   # keys not given in the override (models not in LiteLLM) are treated as equal to in
+        out.setdefault(k, out['in'])
+    return out
 
 
 def cost_of(side, row):
-    """料金の記録の 1 行の料金（USD）。単価が無ければ None。"""
+    """Cost (USD) of one row of the cost records. None if there is no price."""
     p = price(row.get('model'))
     if not p:
         return None
@@ -196,7 +202,7 @@ def cost_of(side, row):
     return ((row.get('in', 0) - row.get('cached', 0)) * p['in'] + row.get('cached', 0) * p['cr'] + row.get('out', 0) * p['out']) / 1e6
 
 
-# ---- 料金の記録（会話ログから写して溜める） ----
+# ---- cost records (copied from the conversation logs and accumulated) ----
 def _walk_jsonl(root):
     for d, _, fs in os.walk(root):
         for f in fs:
@@ -209,12 +215,12 @@ def _ts(s):
 
 
 def _claude_rows(path, start):
-    """Claude Code の会話ログ（start バイト目から）の応答ごとのトークン数。返り値 (行の一覧, 読み終えた位置)。"""
+    """Token counts per response in a Claude Code conversation log (from byte start). Returns (list of rows, position read up to)."""
     out = []
     with open(path, 'rb') as f:
         f.seek(start)
         data = f.read()
-    end = data.rfind(b'\n') + 1          # 書きかけの最後の行は次に回す
+    end = data.rfind(b'\n') + 1          # a partially written last line is left for next time
     for line in data[:end].decode('utf-8', 'replace').splitlines():
         if '"usage"' not in line:
             continue
@@ -239,8 +245,9 @@ def _claude_rows(path, start):
     return out, start + end
 
 
-def _codex_rows(path, start, st):
-    """Codex の会話ログ（start バイト目から）の token_count の増えた分。st は {model, tot, n}（前回の続き）。"""
+def _codex_rows(path, start, st, usage=None):
+    """Increments of token_count in a Codex conversation log (from byte start). st is {model, tot, n} (continued from last time).
+    If usage (a list) is given, the usage in token_count (rate_limits) is also added to it as usage record rows."""
     out = []
     with open(path, 'rb') as f:
         f.seek(start)
@@ -259,13 +266,15 @@ def _codex_rows(path, start, st):
             continue
         if p.get('type') != 'token_count':
             continue
+        if usage is not None and d.get('timestamp'):
+            _codex_usage_rows(p.get('rate_limits') or {}, d['timestamp'], usage)
         tot = (p.get('info') or {}).get('total_token_usage')
         if not tot or not d.get('timestamp'):
             continue
         cur = [tot.get('input_tokens') or 0, tot.get('cached_input_tokens') or 0, tot.get('output_tokens') or 0]
         prev = st.get('tot')
         if prev and cur[0] < prev[0]:
-            prev = None                      # 累計が戻った（数え直し）
+            prev = None                      # the running total went back (counting restarted)
         dl = [c - (prev[k] if prev else 0) for k, c in enumerate(cur)]
         st['tot'] = cur
         if sum(dl) <= 0:
@@ -279,9 +288,53 @@ def _codex_rows(path, start, st):
     return out, start + end
 
 
+def _codex_usage_rows(rl, stamp, out):
+    """rate_limits {primary, secondary} in a Codex conversation log → usage record rows."""
+    try:
+        ts = int(_ts(stamp))
+    except ValueError:
+        return
+    for k in ('primary', 'secondary'):
+        w = rl.get(k)
+        try:
+            if w and w.get('window_minutes') and w.get('resets_at'):
+                out.append({'ts': ts, 'side': 'codex', 'win': int(w['window_minutes']), 'u': float(w['used_percent']),
+                            'r': int(w['resets_at']), 'src': 'codex-sessions'})
+        except (TypeError, ValueError, KeyError):
+            continue
+
+
+def _token_pace_rows(path, start, name):
+    """claude-token-pace records (from byte start) → usage record rows. Returns (list of rows, position read up to)."""
+    with open(path, 'rb') as f:
+        f.seek(start)
+        data = f.read()
+    end = data.rfind(b'\n') + 1
+    out = []
+    for line in data[:end].decode('utf-8', 'replace').splitlines():
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(d, dict):
+            continue
+        if name == 'pace.jsonl':
+            vals = [('claude', 300, d.get('h5'), d.get('h5r')), ('claude', 10080, d.get('d7'), d.get('d7r'))]
+        else:
+            vals = [('codex', d.get('w'), d.get('u'), d.get('r')), ('codex', d.get('w2'), d.get('u2'), d.get('r2'))]
+        for side, win, u, r in vals:
+            try:
+                if win and r and u is not None:
+                    out.append({'ts': int(d['ts']), 'side': side, 'win': int(win), 'u': float(u), 'r': int(r), 'src': 'token-pace'})
+            except (TypeError, ValueError, KeyError):
+                continue
+    return out, start + end
+
+
 def sync_costs(full=False):
-    """会話ログの増えた分を料金の記録に足す。full でなければ、前回の位置から読む（初めての環境では import か sample が全部読む）。
-    返り値 {side: 足した行数}。"""
+    """Add the new part of the conversation logs to the cost records. Unless full, read from the previous position (if there are no cost records yet, the first now or sample reads everything).
+    In the same read, add the usage in the Codex conversation logs and the claude-token-pace records (if found) to the usage records (overlapping rows are not added).
+    Returns {side: rows added, 'usage': usage rows added}."""
     import fcntl
     try:
         state = json.load(open(COST_STATE))
@@ -290,6 +343,7 @@ def sync_costs(full=False):
     if not state and not full:
         return {}
     added = {}
+    usage, reread = [], bool(full)   # reread: a part read before was read again (usage rows may overlap)
     for side, root in (('claude', os.path.join(CLAUDE_HOME, 'projects')), ('codex', os.path.join(CODEX_HOME, 'sessions'))):
         ss = state.setdefault(side, {})
         have = {}
@@ -306,6 +360,7 @@ def sync_costs(full=False):
             if prev.get('size') == size and prev.get('mtime') == mtime:
                 continue
             pos = prev.get('pos', 0) if prev.get('size', 0) <= size else 0
+            reread = reread or (bool(prev) and pos == 0)
             if side == 'claude':
                 rows, pos = _claude_rows(path, pos)
                 for x in rows:
@@ -315,7 +370,7 @@ def sync_costs(full=False):
                 ss[path] = {'size': size, 'mtime': mtime, 'pos': pos}
             else:
                 cst = {k: prev.get(k) for k in ('model', 'tot', 'n')} if pos else {}
-                rows, pos = _codex_rows(path, pos, cst)
+                rows, pos = _codex_rows(path, pos, cst, usage)
                 new += rows
                 ss[path] = {'size': size, 'mtime': mtime, 'pos': pos, **cst}
         if new:
@@ -325,6 +380,32 @@ def sync_costs(full=False):
                 for x in sorted(new, key=lambda x: x['ts']):
                     f.write(json.dumps(x) + '\n')
         added[side] = len(new)
+    tp = state.setdefault('token-pace', {})
+    for name in ('pace.jsonl', 'codex.jsonl'):
+        path = TP + name
+        try:
+            size, mtime = os.path.getsize(path), os.path.getmtime(path)
+        except OSError:
+            continue
+        prev = tp.get(name) or {}
+        if prev.get('size') == size and prev.get('mtime') == mtime:
+            continue
+        pos = prev.get('pos', 0) if prev.get('size', 0) <= size else 0
+        reread = reread or (bool(prev) and pos == 0)
+        rows, pos = _token_pace_rows(path, pos, name)
+        usage += rows
+        tp[name] = {'size': size, 'mtime': mtime, 'pos': pos}
+    if usage and reread:
+        have = {(x['ts'], x['side'], row_id(x)) for x in read_log()}
+        uniq = []
+        for x in usage:
+            k = (x['ts'], x['side'], row_id(x))
+            if k not in have:
+                have.add(k)
+                uniq.append(x)
+        usage = uniq
+    record(sorted(usage, key=lambda x: x['ts']))
+    added['usage'] = len(usage)
     os.makedirs(DATA, exist_ok=True)
     tmp = COST_STATE + '.tmp'
     json.dump(state, open(tmp, 'w'))
@@ -348,7 +429,7 @@ def read_jsonl(path):
 
 
 def cost_events(side, scope_model=None):
-    """[(時刻, 料金)]（時刻順）と、単価の無かったモデルの一覧。Claude は同じ応答を出力の最大の 1 行に。"""
+    """[(time, cost)] (in time order) and the list of models without a price. For Claude, each response becomes its one row with the largest output."""
     rows = read_jsonl(COST_LOG[side])
     if side == 'claude':
         best = {}
@@ -365,7 +446,7 @@ def cost_events(side, scope_model=None):
             continue
         c = cost_of(side, x)
         if c is None:
-            if x.get('model') != '<synthetic>':   # Claude Code が自分で書く応答（API を呼んでいない）
+            if x.get('model') != '<synthetic>':   # responses Claude Code writes itself (the API was not called)
                 miss.add(x.get('model') or '(no model recorded)')
             c = 0.0
         ev.append((x['ts'], c))
@@ -373,17 +454,17 @@ def cost_events(side, scope_model=None):
     return ev, sorted(miss)
 
 
-# ---- 料金の列（15 分ごと） ----
+# ---- cost series (every 15 minutes) ----
 Q = 900
 
 
 class CostSeries:
-    """15 分ごとの料金の列。x[i]＝[T0 + i·Q, T0 + (i+1)·Q) の料金。T0 は最初の料金のある日のローカル 0 時。"""
+    """Cost series every 15 minutes. x[i] = cost in [T0 + i·Q, T0 + (i+1)·Q). T0 is local midnight of the first day with a cost."""
 
     def __init__(self, ev, t_end):
         d0 = datetime.datetime.fromtimestamp(ev[0][0] if ev else t_end).date()
         self.T0 = time.mktime((d0.year, d0.month, d0.day, 0, 0, 0, 0, 0, -1))
-        self.n = int((t_end - self.T0) // Q) + 1   # 最後は t_end を含む（途中までの）区切り
+        self.n = int((t_end - self.T0) // Q) + 1   # the last slot is the (partial) one containing t_end
         self.x = [0.0] * self.n
         for t, c in ev:
             i = int((t - self.T0) // Q)
@@ -399,7 +480,7 @@ class CostSeries:
         return self.cs[min(i + n, self.n)] - self.cs[max(min(i, self.n), 0)]
 
     def cal(self, i):
-        """区切り i の (時, 休日か, 日の番号)。i は列の外でもよい（時刻から決める）。"""
+        """(hour, whether a holiday, day number) of slot i. i may be outside the series (derived from the time)."""
         v = self._cal.get(i)
         if v is None:
             lt = time.localtime(self.T0 + i * Q + 1)
@@ -429,7 +510,7 @@ def _hw(i, s, hl):
 
 
 def _seasonal(cs_, i, lo, hi):
-    """[lo, hi] の開始のうち、i と同じ時刻（15 分単位）・同じ休日かのもの（3 つ未満なら全部）。"""
+    """Starts in [lo, hi] with the same time of day as i (in 15-minute units) and the same holiday-or-not (all of them if fewer than 3)."""
     h, od, _ = cs_.cal(i)
     q = i % 4
     s = [j for j in range(lo, hi + 1) if j % 4 == q and cs_.cal(j)[0] == h and cs_.cal(j)[1] == od]
@@ -437,7 +518,7 @@ def _seasonal(cs_, i, lo, hi):
 
 
 class Empirical:
-    """同じ時刻・同じ休日かの過去の実績 S(s, x)（最近ほど重く）。"""
+    """Past actuals S(s, x) at the same time of day and the same holiday-or-not (more recent weighs more)."""
 
     def __init__(self, halflife=7):
         self.hl = halflife
@@ -454,7 +535,7 @@ class Empirical:
 
 
 class LevelScaled:
-    """同じ時刻の実績 S(s, x) を、s の直前 days 日の料金で割り、今の直前 days 日の料金をかける。"""
+    """Actuals S(s, x) at the same time of day, divided by the cost of the days days before s and multiplied by the cost of the days days before now."""
 
     def __init__(self, days):
         self.L = days * 96
@@ -477,13 +558,13 @@ class LevelScaled:
 
 
 def _ess_weights(rec, dist, ess):
-    """重み w = rec × exp(−(dist/h)²)。h は、似ている度合いだけの重み exp(−(dist/h)²) の実質の点数 (Σk)²/Σk² が ess になるよう決める。
-    この実質の点数は h について単調なので h は 1 つに決まり、w は距離・新しさに連続に依存する
-    （新しさを掛けた重みで合わせると解が複数あり、特徴が少し動くだけで別の解に跳ぶ）。"""
+    """Weight w = rec × exp(−(dist/h)²). h is chosen so that the effective number of points (Σk)²/Σk² of the similarity-only weight exp(−(dist/h)²) equals ess.
+    This effective number is monotonic in h, so h is unique and w depends continuously on distance and recency
+    (matching with the recency-multiplied weights has several solutions and jumps to another one when the features move slightly)."""
     if len(dist) <= ess:
         return list(rec)
     d0 = min(dist)
-    d = [v - d0 for v in dist]                      # 最も近い点を 1 に（exp の下限で全部 0 にならないように）
+    d = [v - d0 for v in dist]                      # make the nearest point 1 (so that the exp floor does not make them all 0)
 
     def e(h):
         k = [math.exp(-min((v / h) ** 2, 700.0)) for v in d]
@@ -505,12 +586,12 @@ def _sd(col, floor=1e-6):
 
 
 class KNN:
-    """似た過去の時点のその後。固定の K 点で切らず、重み＝最近ほど重く（halflife 日）× 似ているほど重く（ガウス）。
-    ガウスの幅は、似ている度合いだけの重みの実質の点数が決めた数になるよう決めるので、開始がずれても重みは連続に動く。
-    x が 1 日以上：毎日、今と同じ時刻の開始を 1 つ（開始がずれれば候補も同じだけずれる）。似ている＝直前 24 時間・7 日の料金と、
-      予測する期間の休日の割合が近い（候補を休日かで切らない）。実質の日数 ESS_LONG。
-    x が 1 日未満：同じ休日かの開始。x の未来が大きく重なる開始（4 時間以上は 4 時間、1 時間以上は 1 時間のまとまり）は、いちばん似た 1 つに数える。
-      似ている＝時刻が近い・直前 1・4・24 時間・7 日の料金が近い。実質の点数 ESS_SHORT。"""
+    """What followed similar past points in time. Not cut at a fixed K points; weight = more recent weighs more (halflife days) × more similar weighs more (Gaussian).
+    The Gaussian width is chosen so that the effective number of points of the similarity-only weight is a fixed number, so the weights move continuously when the start shifts.
+    x of 1 day or more: one start per day at the same time of day as now (if the start shifts, the candidates shift by the same amount). Similar = close in the cost of the previous 24 hours and 7 days, and in
+      the holiday share of the forecast period (candidates are not split by holiday-or-not). Effective number of days ESS_LONG.
+    x under 1 day: starts with the same holiday-or-not. Starts whose futures of length x largely overlap (blocks of 4 hours for 4 hours or more, 1 hour for 1 hour or more) count as the single most similar one.
+      Similar = close in time of day and in the cost of the previous 1, 4 and 24 hours and 7 days. Effective number of points ESS_SHORT."""
     ESS_SHORT, ESS_LONG = 20, 8
 
     def __init__(self, halflife=7):
@@ -532,14 +613,14 @@ class KNN:
 
     @staticmethod
     def _offfrac(cs_, a, xx):
-        """区切り a から x 区切りのうち休日の割合（暦から。列の外でもよい）。"""
+        """Share of holiday slots among the x slots from slot a (from the calendar; may be outside the series)."""
         c = cs_.__dict__.setdefault('_offc', [0])
         while len(c) <= a + xx:
             c.append(c[-1] + cs_.cal(len(c) - 1)[1])
         return (c[a + xx] - c[a]) / xx
 
     def neighbours(self, cs_, i, xx):
-        """(選んだ開始, 重み)。候補が無い（記録が x より短い）なら ([], [])。"""
+        """(chosen starts, weights). ([], []) if there are no candidates (the records are shorter than x)."""
         if xx >= 96:
             cand = [s for s in range(i - 96, 671, -96) if s + xx <= i]
             if not cand:
@@ -548,7 +629,7 @@ class KNN:
             q = [self._f(cs_, s) for s in cand]
             F = [[f[2], f[3], self._offfrac(cs_, s, xx)] for s, f in zip(cand, q)]
             fi = [fi[2], fi[3], self._offfrac(cs_, i, xx)]
-            # 休日の割合がほぼ同じ候補ばかりのとき、わずかな差を大きく数えない
+            # when the candidates all have nearly the same holiday share, do not count tiny differences as large
             sd = [_sd([f[k] for f in F], fl) for k, fl in ((0, 1e-6), (1, 1e-6), (2, 0.05))]
             dist = [sum(abs(f[k] - fi[k]) / sd[k] for k in range(3)) for f in F]
             return cand, _ess_weights([_hw(i, s, self.hl) for s in cand], dist, self.ESS_LONG)
@@ -559,7 +640,7 @@ class KNN:
         F = [self._f(cs_, s) for s in cand]
         sd = [_sd([f[k] for f in F]) for k in range(4)]
         b = self._block(xx)
-        best = {}                                  # まとまり → (距離, 開始)。同じ距離なら新しいほう
+        best = {}                                  # block → (distance, start). On equal distance, the newer one
         for s, f in zip(cand, F):
             dh = abs(cs_.cal(s)[0] - hi)
             dh = min(dh, 24 - dh) / 3.0
@@ -574,19 +655,28 @@ class KNN:
         out = []
         for xx in xs:
             nn, w = self.neighbours(cs_, i, xx)
-            # 候補が無い（記録が x より短い）：この部品は混ぜない
+            # no candidates (the records are shorter than x): this part is not mixed in
             out.append(_wchoice(rng, [cs_.S(s, xx) for s in nn], w, n) if nn else [])
         return out
 
 
 class Hurdle:
-    """15 分ごとに、使うか（直前に使ったか・休日か・時刻で決まる確率）× いくら（同じ休日かの標本）をシミュレーション。最近ほど重く。"""
+    """Simulates, every 15 minutes, whether used (a probability set by whether used just before, holiday-or-not and time of day) × how much (samples with the same holiday-or-not). More recent weighs more."""
 
     def __init__(self, halflife=7):
         self.hl = halflife
 
+    PRIOR = 2.0   # prior weight (count) of the per-hour "probability of use". The prior value is the overall share of use (hours with few records are not taken as 0.5)
+
     def fit(self, cs_, i):
-        num, den = [[[0.5] * 2 for _ in range(24)] for _ in range(2)], [[[1.0] * 2 for _ in range(24)] for _ in range(2)]
+        act = [[0.5, 1.0], [0.5, 1.0]]                   # whether used just before → [times used, count]
+        for j in range(1, i):
+            pa = int(cs_.x[j - 1] > 0)
+            act[pa][0] += cs_.x[j] > 0
+            act[pa][1] += 1
+        r = [a / n for a, n in act]
+        num = [[[r[k] * self.PRIOR for k in range(2)] for _ in range(24)] for _ in range(2)]
+        den = [[[self.PRIOR] * 2 for _ in range(24)] for _ in range(2)]
         sizes, sw = {0: [], 1: []}, {0: [], 1: []}
         for j in range(1, i):
             w = _hw(i, j, self.hl)
@@ -633,7 +723,7 @@ def _accum(w):
 
 
 class DailyTopDown:
-    """日の合計を予測して時刻の割合で割り振る。log1p(日の合計) ＝ 水準 ＋ 休日の差 ＋ ばらつき、水準は指数平滑（alpha）。"""
+    """Forecasts the daily total and spreads it by time-of-day shares. log1p(daily total) = level + holiday difference + noise; the level is exponentially smoothed (alpha)."""
 
     def __init__(self, alpha=0.3, halflife=14):
         self.alpha, self.hl = alpha, halflife
@@ -646,13 +736,16 @@ class DailyTopDown:
         m = {o: [v for v, oo in zip(y, od) if oo == o] for o in (0, 1)}
         base = sum(m[0]) / len(m[0]) if m[0] else 0.0
         self.seas = [0.0, (sum(m[1]) / len(m[1]) - base) if m[1] and m[0] else 0.0]
-        lv = (y[0] - self.seas[od[0]]) if y else 0.0
+        adj = [v - self.seas[o] for v, o in zip(y, od)]
+        # the initial level is the mean of the first few days (up to 7 days). Residuals are shifted to mean 0 (so that with few days, a bias in the residuals does not pile up every day and diverge)
+        lv = sum(adj[:7]) / len(adj[:7]) if adj else 0.0
         res = []
-        for v, o in zip(y, od):
-            e = v - (lv + self.seas[o])
+        for v in adj:
+            e = v - lv
             res.append(e)
             lv += self.alpha * e
-        self.level, self.res = lv, (res[1:] or [0.0])
+        mu = sum(res) / len(res) if res else 0.0
+        self.level, self.res = lv, ([e - mu for e in res] or [0.0])
         prof = [[1e-9] * 96 for _ in range(2)]
         for j in range(0, d_now * 96):
             prof[cs_.cal(j)[1]][j % 96] += _hw(i, j, self.hl) * cs_.x[j]
@@ -698,9 +791,9 @@ class DailyTopDown:
         return out
 
 
-PARTS = ('knn_w7', 'seas_w7', 'hurdle', 'lvl7', 'lvl3', 'daily')   # wpool の部品（weights.json の並び）
+PARTS = ('knn_w7', 'seas_w7', 'hurdle', 'lvl7', 'lvl3', 'daily')   # wpool parts (in the order of weights.json)
 POOL2 = ('knn_w7', 'lvl7', 'daily')
-W_HOURS = (1, 2, 4, 8, 12, 24)    # wpool の重みを持つ x（時間）。x がこの範囲を越えれば pool2
+W_HOURS = (1, 2, 4, 8, 12, 24)    # x (hours) that have wpool weights. If x goes beyond this range, pool2
 N_SAMP = 400
 
 
@@ -709,28 +802,45 @@ def make_parts():
             'daily': DailyTopDown()}
 
 
+# form of the parts the weights were learned with. Raise it when the parts (PARTS) or their contents (such as how knn chooses) change. Weights of a different form are not used
+# (for data/weights.json, the next sample or install.sh relearns them; until then, the bundled default)
+WEIGHTS_FORM = 3
+
+
+def weights_form_ok(d):
+    return d.get('form') == WEIGHTS_FORM and list(d.get('parts') or []) == list(PARTS)
+
+
+def _read_weights(f):
+    try:
+        with open(f) as fh:
+            d = json.load(fh)
+        if not weights_form_ok(d):
+            return {}
+        return {int(k): [float(v) for v in vs] for k, vs in d['weights'].items()}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return {}
+
+
 def load_weights():
-    """{x（時間）: [PARTS の重み]}。学んだもの（data/weights.json）が無ければ同梱の既定。"""
-    for f in (WEIGHTS_FILE, _conf('weights-default.json')):
-        try:
-            d = json.load(open(f))
-            w = {int(k): [float(v) for v in vs] for k, vs in d['weights'].items()}
-            if w:
-                return w, f
-        except (OSError, ValueError, KeyError, TypeError):
-            continue
-    return {h: [1.0 / len(PARTS)] * len(PARTS) for h in W_HOURS}, None
+    """{x (hours): [weights of PARTS]}. Per x, the learned ones (data/weights.json; not used if the form differs),
+    else the bundled default, else equal shares. The second value is weights.json if any learned weight is used, else the default file."""
+    default_file = _conf('weights-default.json')
+    learned, default = _read_weights(WEIGHTS_FILE), _read_weights(default_file)
+    equal = [1.0 / len(PARTS)] * len(PARTS)
+    w = {h: learned.get(h) or default.get(h) or equal for h in W_HOURS}
+    return w, (WEIGHTS_FILE if learned else default_file if default else None)
 
 
 def _bucket(xx):
-    """x（区切りの数）に重みを使う評価点（時間）。24 時間を越えれば None（pool2）。"""
+    """Evaluation point (hours) whose weights are used for x (number of slots). None beyond 24 hours (pool2)."""
     if xx > W_HOURS[-1] * 4:
         return None
     return min(W_HOURS, key=lambda h: abs(math.log(h * 4) - math.log(max(xx, 1))))
 
 
 def forecast(cs_, i, xs, n=N_SAMP, seed=0, weights=None):
-    """区切り i から x 区切りの間に使う料金の標本（xs の順の一覧）。"""
+    """Samples of the cost used over x slots from slot i (a list in the order of xs)."""
     rng = random.Random(seed)
     parts = make_parts()
     for p in parts.values():
@@ -741,8 +851,13 @@ def forecast(cs_, i, xs, n=N_SAMP, seed=0, weights=None):
     for xx in xs:
         b = _bucket(xx)
         w = weights.get(b) if b else None
-        names, ws = (PARTS, w) if w else (POOL2, [1.0 / len(POOL2)] * len(POOL2))
-        # 標本の無い部品（記録が x より短く、候補が無い）は外し、残りの割合を合わせ直す。どれも無ければ None
+        if w:
+            names, ws = PARTS, w
+        else:
+            # when the records are short and knn and lvl7 have no samples (beyond 1 day, with records shorter than 7 days + x), mix in hurdle too instead of daily alone
+            names = POOL2 + (('hurdle',) if not smp['knn_w7'][xx] and not smp['lvl7'][xx] else ())
+            ws = [1.0 / len(names)] * len(names)
+        # drop parts without samples (records shorter than x, no candidates) and rescale the remaining shares. None if none are left
         have = [(nm, v) for nm, v in zip(names, ws) if v > 0 and smp[nm][xx]]
         tot = sum(v for _, v in have)
         if not have or tot <= 0:
@@ -760,7 +875,7 @@ def forecast(cs_, i, xs, n=N_SAMP, seed=0, weights=None):
 
 
 def _abs_mean(a, b):
-    """E|A − B|（標本どうし）。並べ替えと累積和で O(n log n)。"""
+    """E|A − B| (between samples). O(n log n) by sorting and cumulative sums."""
     b = sorted(b)
     acc = [0.0]
     for v in b:
@@ -772,11 +887,12 @@ def _abs_mean(a, b):
     return tot / (len(a) * m)
 
 
-def calibrate(quiet=False, every=8, sub=50, step=0.05):
-    """料金の記録から wpool の重みを x（W_HOURS）ごとに学ぶ：結果が分かっている過去の開始 j（j + x ≤ 今）で、
-    混ぜた分布の CRPS（Σ w_a E|X_a − y| − ½ Σ w_a w_b E|X_a − X_b|）の平均が最小の重み（step 刻み）。
-    開始は直近 CALIBRATE_DAYS 日の 2 時間おき（every 区切り。古い会話ログは消えて料金が欠けていることがあり、使い方も変わるため）。
-    最初の 14 日は学習だけ。開始が 20 未満の x は学ばない（既定の重み）。"""
+def calibrate(quiet=False, every=None, sub=50, step=0.05):
+    """Learn the wpool weights per x (W_HOURS) from the cost records: over past starts j whose outcome is known (j + x ≤ now),
+    the weights (in steps of step) that minimise the mean CRPS of the mixed distribution (Σ w_a E|X_a − y| − ½ Σ w_a w_b E|X_a − X_b|).
+    Starts are every 2 hours over the last CALIBRATE_DAYS days (every slots; old conversation logs disappear so costs may be missing, and the way of use also changes).
+    Only starts where every part has samples are used (lvl7 needs 7 days + x of records before the start). x with fewer than 20 starts is not learned (default weights)."""
+    every = every or CALIBRATE_EVERY
     t = time.time()
     ev, _ = cost_events(MAIN_SIDE_FOR_WEIGHTS)
     if not ev:
@@ -789,7 +905,7 @@ def calibrate(quiet=False, every=8, sub=50, step=0.05):
     parts = make_parts()
     rng = random.Random(1)
     last_day = None
-    first = max(14 * 96, cs_.n - CALIBRATE_DAYS * 96)
+    first = max(0, cs_.n - CALIBRATE_DAYS * 96)
     first += (-first) % every
     for i in range(first, cs_.n, every):
         ok = [xx for xx in xs if i + xx <= cs_.n]
@@ -819,19 +935,22 @@ def calibrate(quiet=False, every=8, sub=50, step=0.05):
         best = min(grid, key=lambda w: sum(w[j] * a[j] for j in range(k)) - 0.5 * sum(w[x] * w[y] * b[x][y] for x in range(k) for y in range(k)))
         out[h] = best
         quiet or print(f'{h}h: origins {len(A[h])}  weights ' + ' '.join(f'{nm} {v:.2f}' for nm, v in zip(PARTS, best)))
+    # write even when learning failed (even with no x learned). The write time limits relearning to once a day. x that were not learned use the bundled default
+    os.makedirs(DATA, exist_ok=True)
+    tmp = WEIGHTS_FILE + '.tmp'
+    with open(tmp, 'w') as fh:
+        json.dump({'form': WEIGHTS_FORM, 'parts': PARTS, 'weights': {str(h): w for h, w in out.items()}, 'n_origins': {str(h): len(A[h]) for h in out}}, fh)
+    os.replace(tmp, WEIGHTS_FILE)
     if not out:
         quiet or print('not enough origins to learn from (keeping default weights)')
         return None
-    os.makedirs(DATA, exist_ok=True)
-    tmp = WEIGHTS_FILE + '.tmp'
-    json.dump({'parts': PARTS, 'weights': {str(h): w for h, w in out.items()}, 'n_origins': {str(h): len(A[h]) for h in out}}, open(tmp, 'w'))
-    os.replace(tmp, WEIGHTS_FILE)
     quiet or print('->', WEIGHTS_FILE)
     return out
 
 
 CALIBRATE_DAYS = 28
-MAIN_SIDE_FOR_WEIGHTS = 'claude'   # 重みは Claude の料金で学ぶ（評価したのは Claude だけ）。Codex も同じ重みを使う
+CALIBRATE_EVERY = 8   # interval between learning starts (in slots; 2 hours)
+MAIN_SIDE_FOR_WEIGHTS = 'claude'   # the weights are learned from Claude's cost (only Claude was evaluated). Codex uses the same weights
 
 
 def _simplex(k, step):
@@ -849,30 +968,34 @@ def _simplex(k, step):
 
 
 def maybe_calibrate(t):
-    """sample から：weights.json が 1 日より古い（または無い）とき、料金の記録が 15 日分以上あれば学び直す。"""
+    """From sample: when weights.json is older than 1 day, missing, or of a different form, relearn if the records are long enough to learn from
+    (long enough for 20 starts where every part has samples at the shortest x. weights.json is written even when learning fails, so it is tried once a day)."""
     try:
-        if t - os.path.getmtime(WEIGHTS_FILE) < 86400:
+        with open(WEIGHTS_FILE) as fh:
+            same = weights_form_ok(json.load(fh))
+        if same and t - os.path.getmtime(WEIGHTS_FILE) < 86400:
             return False
-    except OSError:
+    except (OSError, ValueError, AttributeError):
         pass
     ev, _ = cost_events(MAIN_SIDE_FOR_WEIGHTS)
-    if not ev or ev[-1][0] - ev[0][0] < 15 * 86400:
+    need = (max(p.L for p in make_parts().values() if isinstance(p, LevelScaled)) + W_HOURS[0] * 4 + 20 * CALIBRATE_EVERY) * Q
+    if not ev or ev[-1][0] - ev[0][0] < need:
         return False
     return calibrate(quiet=True) is not None
 
 
-# ---- 使用率の記録 ----
-CONFIRM = 1800   # 使用率の上がり・戻りを本物とみなすか、この秒数のあとの観測の多数決で決める
-EPS = 0.5        # 使用率の比べで同じとみなす幅（%）
-RESET_U = 5.0    # 窓の途中で使用率がこれ以下に戻ったときだけリセットとみなす（リセットは 0 から数え直す）
+# ---- usage records ----
+CONFIRM = 1800   # whether a rise or drop in usage is real is decided by majority vote of the observations within this many seconds after it
+EPS = 0.5        # margin (%) within which usage values are treated as equal
+RESET_U = 5.0    # only a drop to this or below in the middle of a period is treated as a reset (a reset counts again from 0)
 
 
 def clean_points(pts):
-    """1 つの窓の観測 [(ts, u)]（時刻順）から、古い値を除き、途中のリセットで切る。返り値は区間の一覧（各区間は使用率が減らない）。
-    複数のセッションが、それぞれ最後に受け取った使用率を書くので、新しい値の間に古い値が混ざる。
-    上がった値は、あとの観測の多数が同じ以上なら採る（混ざった古い値で上がって見えるだけのものを除く。リセット後とみられる RESET_U 以下の値は数えない）。
-    下がった値は、RESET_U 以下で、あとの観測の多数も今の値より下ならリセットとして新しい区間を始める。それ以外は古い値として捨てる。
-    あとの観測：CONFIRM 秒以内のもの。無ければ次の 1 つ。"""
+    """From the observations [(ts, u)] of one period (in time order), drop stale values and cut at resets in the middle. Returns a list of segments (usage never decreases within a segment).
+    Several sessions each write the last usage they received, so stale values mix in between new ones.
+    A risen value is taken if most later observations are the same or higher (this drops values that only look risen because of mixed-in stale values; values at or below RESET_U that look post-reset are not counted).
+    A dropped value starts a new segment as a reset if it is at or below RESET_U and most later observations are also below the current value. Otherwise it is discarded as a stale value.
+    Later observations: those within CONFIRM seconds. If there are none, the next one."""
     segs, level, j = [[]], None, 0
     for i, (t, u) in enumerate(pts):
         j = max(j, i + 1)
@@ -884,7 +1007,7 @@ def clean_points(pts):
             level = u
         elif u >= level - EPS:
             hi = sum(1 for v in later if v >= u - EPS)
-            lo = sum(1 for v in later if v < u - EPS and not (v <= RESET_U < level))   # リセット後とみられる値は数えない
+            lo = sum(1 for v in later if v < u - EPS and not (v <= RESET_U < level))   # values that look post-reset are not counted
             if hi >= lo:
                 level = max(level, u)
                 segs[-1].append((t, level))
@@ -897,7 +1020,7 @@ def clean_points(pts):
 
 
 def row_id(x):
-    """記録の行の枠の種類。id の無い古い行は長さから（Claude 300→session・10080→weekly_all、Codex は長さ）。"""
+    """Window kind of a record row. For old rows without id, from the length (Claude 300→session, 10080→weekly_all; Codex by the length)."""
     if x.get('id'):
         return x['id']
     if x.get('side') == 'claude':
@@ -914,12 +1037,12 @@ def win_label(win_min):
 
 
 class Series:
-    """1 つの枠の観測 [(ts, u, r)] を窓（リセットごと）に分けて持つ。"""
+    """Holds the observations [(ts, u, r)] of one window, split into periods (one per reset)."""
 
     def __init__(self, side, wid, win_min, samples, scoped=False):
         self.side, self.id, self.win_min, self.win, self.scoped = side, wid, win_min, win_min * 60, scoped
         self.name = f'{side}-{wid}'
-        # リセット済みの窓を報告し続ける古いセッションの値（t >= r）は捨てる。窓はリセット時刻（1 時間以内のぶれは同じ）で分ける
+        # drop values (t >= r) from old sessions that keep reporting a period already reset. Periods are split by reset time (differences within 1 hour count as the same)
         s = sorted((r, t, u) for t, u, r in samples if r and t < r)
         clusters = []
         for r, t, u in s:
@@ -947,7 +1070,7 @@ class Series:
             acc += us[-1]
 
     def total(self, t):
-        """t までに使った量の累計（%。リセットをまたいで足す）。"""
+        """Running total used up to t (%; summed across resets)."""
         i = bisect.bisect_right(self._firsts, t) - 1
         if i < 0:
             return 0.0
@@ -955,7 +1078,7 @@ class Series:
         return self._base[i] + us[bisect.bisect_right(xs, t) - 1]
 
     def u_at(self, t):
-        """t の使用率（窓が終わった後、次の窓の観測までは 0）。"""
+        """Usage at t (0 after a period ends, until the next period is observed)."""
         i = bisect.bisect_right(self._firsts, t) - 1
         if i < 0 or t >= self._gs[i][1]:
             return 0.0
@@ -964,7 +1087,7 @@ class Series:
 
 
 def load_series(side, rows=None, until=None):
-    """{枠の種類: Series}。"""
+    """{window kind: Series}."""
     by, meta = {}, {}
     for x in rows if rows is not None else read_log():
         if x.get('side') != side or not x.get('r') or not x.get('win') or (until is not None and x['ts'] > until):
@@ -976,7 +1099,7 @@ def load_series(side, rows=None, until=None):
 
 
 def record(rows, src='live'):
-    """記録に足す（同時に書くプロセスがあっても行が混ざらないよう flock）。記録から借りた行（cached）は足さない。"""
+    """Add to the records (flock, so lines do not interleave even if another process writes at the same time). Rows borrowed from the records (cached) are not added."""
     import fcntl
     rows = [x for x in rows if not x.get('cached')]
     if not rows:
@@ -993,13 +1116,13 @@ def read_log():
     return read_jsonl(USAGE_LOG)
 
 
-# ---- 上限の金額と使い切る確率 ----
+# ---- limit amount and exhaust probability ----
 def limit_hist(ser, cs_, t):
-    """記録の分の上限（$）：t より前を 1 時間ずつさかのぼり、使用率の伸びが 100% に届くまでの料金 ÷ 伸び。伸びが 20% 未満なら None。
-    さかのぼるのは 28 日・料金の記録の始まり・使用率の記録の始まりのうち最も近いところまで。"""
+    """Limit ($) from history: going back from t 1 hour at a time, cost until the usage growth reaches 100% ÷ growth. None if the growth is under 20%.
+    It goes back to the nearest of 28 days, the start of the cost records and the start of the usage records."""
     c = du = 0.0
     b = t
-    lo = max(cs_.T0, t - 28 * 86400, ser.first)    # 使用率の記録が始まる前の時間は数えない（料金だけ増えて伸びが 0 になる）
+    lo = max(cs_.T0, t - 28 * 86400, ser.first)    # time before the usage records start is not counted (only the cost would grow, with no growth in usage)
     while b - 3600 >= lo:
         a = b - 3600
         if max(ser.u_at(a), ser.u_at(b)) < FULL:
@@ -1012,10 +1135,13 @@ def limit_hist(ser, cs_, t):
 
 
 def limit_usd(ser, cs_, u, t, r, win_min):
-    """上限（$）と出し方。今の枠の分（u ≥ LIMIT_NOW_U）・記録の分・今の枠の分（記録が足りないとき）の順。"""
+    """Limit ($) and how it was obtained. In order: from the current window (u ≥ LIMIT_NOW_U), from history, from the current window (when history is not enough).
+    When the cost records start after the window start, history is used first; if unavailable, the current window with the cost before the records taken as 0
+    (the same assumption as the cost covering only this computer's conversation logs)."""
     start = r - win_min * 60
-    now = 100.0 * cs_.cost_between(start, t) / u if u > 0 and start >= cs_.T0 else None
-    if now is not None and u >= LIMIT_NOW_U:
+    c = cs_.cost_between(start, t)
+    now = 100.0 * c / u if u > 0 and c > 0 else None   # if the cost is 0 (only use elsewhere), it cannot be estimated from the current window
+    if now is not None and u >= LIMIT_NOW_U and start >= cs_.T0:
         return now, 'now'
     h = limit_hist(ser, cs_, t) if ser else None
     if h:
@@ -1024,7 +1150,7 @@ def limit_usd(ser, cs_, u, t, r, win_min):
 
 
 def window_states(rows, t, log=None, n=N_SAMP):
-    """今の読み取り rows から、枠ごとの状態 {名前: {...}}（側ごと）と注記。"""
+    """From the current reads rows, the state of each window {name: {...}} (per side) and notes."""
     log = read_log() if log is None else log
     notes = []
     out = {'claude': {}, 'codex': {}}
@@ -1036,9 +1162,8 @@ def window_states(rows, t, log=None, n=N_SAMP):
         if miss:
             notes.append(f'{side}: models without a price counted as 0 ({", ".join(miss)})')
         cs_ = CostSeries(ev, t) if ev else None
-        enough = bool(ev) and t - ev[0][0] >= 86400
-        if not enough:
-            notes.append(f'{side}: less than 1 day of cost records; no exhaust probability (run import, or let sample accumulate)')
+        if cs_ is None:
+            notes.append(f'{side}: no cost records on this machine; no exhaust probability')
         sers = load_series(side, log)
         need = []
         for x in rs:
@@ -1051,12 +1176,14 @@ def window_states(rows, t, log=None, n=N_SAMP):
             if st['scoped']:
                 st['note'] = 'model-scoped window (shown only, not used for the decision)'
                 continue
-            if not enough or u >= FULL:
+            if cs_ is None:
                 continue
             L, src = limit_usd(sers.get(row_id(x)), cs_, u, t, r, win)
-            st['limit_usd'], st['limit_src'] = L, src
-            if L:
-                # 予測は今の区切りの始まりから（入力は終わった区切りだけ。評価・学習と同じ）。今の区切りの使った分は u にも入るので少し多めに見る
+            st['limit_usd'], st['limit_src'] = (L, src) if L else (None, None)
+            if not L:
+                st['note'] = 'limit unknown (no cost or no usage in this window yet, and no usage history to estimate from)'
+            else:
+                # the forecast starts at the start of the current slot (inputs are finished slots only, same as evaluation and learning). Use in the current slot is also in u, so this errs slightly high
                 need.append((st, max(int(math.ceil((r - (cs_.T0 + (cs_.n - 1) * Q)) / Q)), 1), L * (1 - u / 100)))
         if need:
             i = cs_.n - 1
@@ -1073,7 +1200,7 @@ def window_states(rows, t, log=None, n=N_SAMP):
 
 
 def decide_states(states, main=MAIN, guard=GUARD_RISK, default=TIE_DEFAULT):
-    """states：{側: {枠の名前: state}}。返り値 (選んだ側, 根拠)。モデルを限った枠は使わない。X の無い枠は歯止め・比較に使わない。"""
+    """states: {side: {window name: state}}. Returns (chosen side, reasons). Model-scoped windows are not used. Windows without X are not used for the guard or the comparison."""
     sub = 'codex' if main == 'claude' else 'claude'
     use = {s: {k: v for k, v in states.get(s, {}).items() if not v.get('scoped')} for s in ('claude', 'codex')}
 
@@ -1084,30 +1211,30 @@ def decide_states(states, main=MAIN, guard=GUARD_RISK, default=TIE_DEFAULT):
     over = [k for k, v in use[main].items() if v['X'] is not None and v['X'] > guard]
     tight = [k for k, v in use[sub].items() if v['win'] < LONG_WIN and v['X'] is not None and v['X'] > guard]
     L = {s: leftover(use[s]) for s in use}
-    why = {'main': main, 'claude_L': L['claude'], 'codex_L': L['codex'], 'guard': over, 'sub_tight': tight,
-           'full': full['claude'] + full['codex'], 'tie': False}
+    # guard and sub_tight list windows only when the decision was made at that stage. full always lists every full window
+    why = {'main': main, 'claude_L': L['claude'], 'codex_L': L['codex'], 'guard': [], 'sub_tight': [],
+           'full': full['claude'] + full['codex'], 'tie': False, 'stage': ''}
     if full[sub] and not full[main]:
-        return main, why
+        return main, dict(why, stage='full')
     if full[main] and not full[sub]:
-        return sub, why
+        return sub, dict(why, stage='full')
     if over:
-        return sub, why
+        return sub, dict(why, stage='guard', guard=over)
     if tight:
-        return main, why
+        return main, dict(why, stage='guard', sub_tight=tight)
     if L['claude'] == L['codex']:
-        why['tie'] = True
-        return default, why
-    return ('claude' if L['claude'] > L['codex'] else 'codex'), why
+        return default, dict(why, stage='tie', tie=True)
+    return ('claude' if L['claude'] > L['codex'] else 'codex'), dict(why, stage='leftover')
 
 
-# ---- 今の値を直接読む（どちらもモデルを呼ばない） ----
+# ---- read the current values directly (neither calls a model) ----
 def claude_credentials():
-    """Claude Code の OAuth の資格情報（読むだけ。更新しない：更新するとトークンの入れ替わりで Claude Code 本体の認証を壊しうる）。"""
+    """Claude Code's OAuth credentials (read only, never refreshed: refreshing rotates the token and can break the authentication of Claude Code itself)."""
     import subprocess
     f = os.path.join(CLAUDE_HOME, '.credentials.json')
     if os.path.exists(f):
         return json.load(open(f))['claudeAiOauth']
-    if sys.platform == 'darwin':   # macOS は Keychain に保管される（試験的な対応）
+    if sys.platform == 'darwin':   # on macOS they are stored in the Keychain (experimental support)
         p = subprocess.run(['security', 'find-generic-password', '-s', 'Claude Code-credentials', '-w'],
                            capture_output=True, text=True, timeout=10)
         if p.returncode == 0 and p.stdout.strip():
@@ -1120,7 +1247,7 @@ class RateLimited(RuntimeError):
 
 
 def parse_claude(d, notes=None):
-    """使用量 API の応答 → [{side, id, win, u, r, scoped}]。limits の配列が在ればそれ、無ければ five_hour・seven_day。"""
+    """Usage API response → [{side, id, win, u, r, scoped}]. The limits array if present, else five_hour and seven_day."""
     def ts(s):
         return int(datetime.datetime.fromisoformat(s.replace('Z', '+00:00')).timestamp()) if s else None
     out = []
@@ -1147,14 +1274,14 @@ def parse_claude(d, notes=None):
 
 
 def read_claude(t, notes=None):
-    """Claude Code の /usage と同じ GET /api/oauth/usage。"""
+    """GET /api/oauth/usage, the same as /usage in Claude Code."""
     import urllib.error
     import urllib.request
     cred = claude_credentials()
     if cred.get('expiresAt') and cred['expiresAt'] / 1000 < t:
         raise RuntimeError('Claude access token expired (unreadable until Claude Code refreshes it; not refreshed here)')
     url = 'https://api.anthropic.com/api/oauth/usage'
-    test_url = os.environ.get('CLAUDE_CODEX_ROUTER_CLAUDE_URL', '')   # テスト用。トークンを外へ送らないよう手元の偽サーバーだけ許す
+    test_url = os.environ.get('CLAUDE_CODEX_ROUTER_CLAUDE_URL', '')   # for tests. Only a local fake server is allowed, so the token is never sent out
     if test_url:
         if not test_url.startswith(('http://127.0.0.1:', 'http://localhost:')):
             raise RuntimeError('CLAUDE_CODEX_ROUTER_CLAUDE_URL must be http://127.0.0.1:... or http://localhost:...')
@@ -1172,63 +1299,68 @@ def read_claude(t, notes=None):
     return out
 
 
-def parse_codex(rl):
-    """rateLimits → [{side, id, win, u, r}]（枠の種類は長さで呼ぶ）。"""
+def parse_codex(d):
+    """ChatGPT usage response (/backend-api/wham/usage) → [{side, id, win, u, r}] (window kinds are named by their length).
+    primary_window and secondary_window of rate_limit (the usage windows of the plan's agent features, including Codex)."""
     out = []
-    for k in ('primary', 'secondary'):
+    rl = (d or {}).get('rate_limit') or {}
+    for k in ('primary_window', 'secondary_window'):
         w = rl.get(k)
-        if w and w.get('resetsAt') and w.get('usedPercent') is not None and w.get('windowDurationMins'):
-            win = int(w['windowDurationMins'])
-            out.append({'side': 'codex', 'id': win_label(win), 'win': win, 'u': float(w['usedPercent']), 'r': int(w['resetsAt'])})
+        if not w or w.get('used_percent') is None or not w.get('limit_window_seconds'):
+            continue
+        r = w.get('reset_at') or (time.time() + w['reset_after_seconds'] if w.get('reset_after_seconds') is not None else None)
+        if not r:
+            continue
+        win = int(w['limit_window_seconds']) // 60
+        out.append({'side': 'codex', 'id': win_label(win), 'win': win, 'u': float(w['used_percent']), 'r': int(r)})
     return out
 
 
-def read_codex(t, timeout=30, notes=None):
-    """codex app-server（stdio の JSON-RPC）に initialize → account/rateLimits/read。"""
-    import select
-    import shutil
-    import subprocess
-    exe = os.environ.get('CLAUDE_CODEX_ROUTER_CODEX') or shutil.which('codex')
-    if not exe:
-        raise RuntimeError('codex not on PATH (set CLAUDE_CODEX_ROUTER_CODEX)')
-    p = subprocess.Popen([exe, 'app-server'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+def _jwt_exp(tok):
+    import base64
     try:
-        for m in ({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {'clientInfo': {'name': 'claude-codex-router', 'version': '0'}}},
-                  {'jsonrpc': '2.0', 'method': 'initialized'},
-                  {'jsonrpc': '2.0', 'id': 2, 'method': 'account/rateLimits/read'}):
-            p.stdin.write((json.dumps(m) + '\n').encode())
-        p.stdin.flush()
-        # 応答は fd から直接読み、行は自分で切る（バッファ付きの readline と select を混ぜると、読み込み済みの行を待ち続ける）
-        fd, buf, end = p.stdout.fileno(), b'', time.time() + timeout
-        while time.time() < end:
-            if not select.select([fd], [], [], max(end - time.time(), 0))[0]:
-                break
-            chunk = os.read(fd, 65536)
-            if not chunk:
-                break
-            buf += chunk
-            while b'\n' in buf:
-                line, buf = buf.split(b'\n', 1)
-                try:
-                    msg = json.loads(line)
-                except ValueError:
-                    continue
-                if msg.get('id') != 2:
-                    continue
-                if 'error' in msg:
-                    raise RuntimeError(f'Codex returned an error: {msg["error"]}')
-                out = parse_codex((msg.get('result') or {}).get('rateLimits') or {})
-                if not out:
-                    raise RuntimeError('no Codex usage windows in the response')
-                return out
-        raise RuntimeError(f'codex app-server did not answer within {timeout} s')
-    finally:
-        p.kill()
-        p.wait()
+        p = tok.split('.')[1]
+        return json.loads(base64.urlsafe_b64decode(p + '=' * (-len(p) % 4))).get('exp')
+    except (IndexError, ValueError, AttributeError):
+        return None
+
+
+def read_codex(t, timeout=15, notes=None):
+    """ChatGPT usage (GET /backend-api/wham/usage; the endpoint written in the Codex CLI executable).
+    The token is only read from Codex's login info ($CODEX_HOME/auth.json, default ~/.codex) and never refreshed (Codex refreshes it)."""
+    import urllib.error
+    import urllib.request
+    f = os.path.join(CODEX_HOME, 'auth.json')
+    try:
+        with open(f) as fh:
+            tokens = json.load(fh).get('tokens') or {}
+    except (OSError, ValueError) as e:
+        raise RuntimeError(f'no Codex login ({f}: {e.__class__.__name__})') from e
+    tok, acct = tokens.get('access_token'), tokens.get('account_id')
+    if not tok:
+        raise RuntimeError('Codex is not logged in with a ChatGPT plan (API-key login has no plan usage)')
+    exp = _jwt_exp(tok)
+    if exp and exp < t:
+        raise RuntimeError('Codex access token expired (unreadable until Codex refreshes it; not refreshed here)')
+    url = 'https://chatgpt.com/backend-api/wham/usage'
+    test_url = os.environ.get('CLAUDE_CODEX_ROUTER_CODEX_URL', '')   # for tests. Only a local fake server is allowed, so the token is never sent out
+    if test_url:
+        if not test_url.startswith(('http://127.0.0.1:', 'http://localhost:')):
+            raise RuntimeError('CLAUDE_CODEX_ROUTER_CODEX_URL must be http://127.0.0.1:... or http://localhost:...')
+        url = test_url
+    h = {'Authorization': 'Bearer ' + tok, 'User-Agent': 'claude-codex-router'}
+    if acct:
+        h['ChatGPT-Account-Id'] = acct
+    with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=timeout) as r:
+        d = json.load(r)
+    out = parse_codex(d)
+    if not out:
+        raise RuntimeError('no Codex usage windows in the response')
+    return out
 
 
 def recent_rows(side, t, max_age=RECENT_MAX_AGE):
-    """記録にある side の最新の読み取り（t から max_age 秒以内）。無ければ []。"""
+    """The latest read of side in the records (within max_age seconds of t). [] if there is none."""
     rows = [x for x in read_log() if x.get('side') == side and x.get('win') and x.get('src') == 'live' and t - max_age <= x['ts'] <= t]
     if not rows:
         return []
@@ -1237,9 +1369,9 @@ def recent_rows(side, t, max_age=RECENT_MAX_AGE):
 
 
 def read_both(t):
-    """両方を読む。片方が読めなくてもう片方は返す。返り値 (rows, 失敗の一覧, 注記の一覧)。
-    Claude は CLAUDE_MIN_INTERVAL 秒以内の記録があれば API を呼ばずにそれを使う。
-    Claude の API が 429 を返したら、呼び直さずに記録の最新の値（RECENT_MAX_AGE 秒以内）を使う。"""
+    """Read both. If one side is unreadable, the other is still returned. Returns (rows, list of failures, list of notes).
+    For Claude, if there is a record within CLAUDE_MIN_INTERVAL seconds, it is used without calling the API.
+    If Claude's API returns 429, the latest value in the records (within RECENT_MAX_AGE seconds) is used without calling again."""
     rows, errs, notes = [], [], []
     for name, f in (('Claude', read_claude), ('Codex', read_codex)):
         if name == 'Claude' and CLAUDE_MIN_INTERVAL > 0:
@@ -1260,63 +1392,16 @@ def read_both(t):
                 notes.append(f'{name}: 429; used the record from {time.strftime("%H:%M:%S", time.localtime(old[0]["ts"]))}')
             else:
                 errs.append(f'{name}: {e} (no record within {RECENT_MAX_AGE // 60} min either)')
-        except Exception as e:   # noqa: BLE001 — 読めない理由をそのまま出す
+        except Exception as e:   # noqa: BLE001 — report why it could not be read as is
             errs.append(f'{name}: {e}')
     return rows, errs, notes
 
 
-def import_history():
-    """この環境に在る過去の記録を取り込む（重複は足さない）。"""
-    import glob
-    added = sync_costs(full=True)
-    print(f'cost rows added: {added} -> {COST_LOG["claude"]}, {COST_LOG["codex"]}')
-    have = {(x['ts'], x['side'], row_id(x)) for x in read_log()}
-    new = []
-
-    def add(ts, side, win, u, r, src):
-        try:
-            x = {'ts': int(ts), 'side': side, 'win': int(win), 'u': float(u), 'r': int(r), 'src': src}
-        except (TypeError, ValueError):
-            return
-        k = (x['ts'], side, row_id(x))
-        if k not in have and r:
-            have.add(k)
-            new.append(x)
-    # Codex のセッションのログ（応答ごとの token_count に使用率が載る）
-    for f in sorted(glob.glob(os.path.join(CODEX_HOME, 'sessions', '*', '*', '*', '*.jsonl'))):
-        for line in open(f, errors='replace'):
-            if '"token_count"' not in line or '"rate_limits"' not in line:
-                continue
-            try:
-                d = json.loads(line)
-                ts = _ts(d['timestamp'])
-            except (ValueError, KeyError):
-                continue
-            rl = (d.get('payload') or {}).get('rate_limits') or {}
-            for k in ('primary', 'secondary'):
-                w = rl.get(k)
-                if w and w.get('window_minutes'):
-                    add(ts, 'codex', w['window_minutes'], w.get('used_percent'), w.get('resets_at'), 'import:codex-sessions')
-    # token-pace（在れば）
-    for name, conv in (('pace.jsonl', lambda d: [(d['ts'], 'claude', 300, d.get('h5'), d.get('h5r')), (d['ts'], 'claude', 10080, d.get('d7'), d.get('d7r'))]),
-                       ('codex.jsonl', lambda d: [(d['ts'], 'codex', d.get('w'), d.get('u'), d.get('r')), (d['ts'], 'codex', d.get('w2'), d.get('u2'), d.get('r2'))])):
-        for d in read_jsonl(TP + name):
-            for ts, side, win, u, r in conv(d):
-                if win:
-                    add(ts, side, win, u, r, 'import:token-pace')
-    new.sort(key=lambda x: x['ts'])
-    record(new)
-    by = {}
-    for x in new:
-        by[x['src']] = by.get(x['src'], 0) + 1
-    print(f'usage rows added: {len(new)} {by} -> {USAGE_LOG}')
-
-
-STALE_SAMPLE = 1800   # 定期の記録（5 分おきの sample）がこれより長く止まっていれば知らせる
+STALE_SAMPLE = 1800   # report when periodic sampling (sample every 5 minutes) has stopped for longer than this
 
 
 def sample_note(t):
-    """定期の記録が止まっていれば注記（判断は now が料金・使用率を足すので続けられる。止まると重みの学び直しと単価の更新が遅れ、記録に穴が空く）。"""
+    """A note if periodic sampling has stopped (decisions can continue because now adds cost and usage; when it stops, relearning the weights and updating the prices are delayed, and the records get gaps)."""
     try:
         last = os.path.getmtime(SAMPLE_STAMP)
     except OSError:
@@ -1324,7 +1409,7 @@ def sample_note(t):
             if t - os.path.getmtime(VERSION_FILE) <= STALE_SAMPLE:
                 return None
         except OSError:
-            return None                  # 入れた版ではない（リポジトリから直接）
+            return None                  # not an installed copy (run directly from the repository)
         return 'periodic sample (every 5 min) has never run; check the timer (README: periodic sampling)'
     if t - last <= STALE_SAMPLE:
         return None
@@ -1332,30 +1417,30 @@ def sample_note(t):
 
 
 def decide_now(t, main=MAIN):
-    """両方を読んで記録に足し、判断する。返り値 (結果の dict, 終了コード)。"""
+    """Read both, add them to the records, and decide. Returns (result dict, exit code)."""
     rows, errs, notes = read_both(t)
     sn = sample_note(t)
     if sn:
         notes.append(sn)
     record(rows)
     try:
-        sync_costs()
-    except Exception as e:   # noqa: BLE001 — 料金の記録が足せなくても判断はする
+        sync_costs(full=not os.path.exists(COST_STATE))   # if there are no cost records yet (before sample), read all the conversation logs
+    except Exception as e:   # noqa: BLE001 — decide even if the cost records could not be added
         notes.append(f'could not add cost records: {e}')
     states, n2 = window_states(rows, t)
     notes += n2
     if _price_src and _price_src.startswith('fetch failed'):
         notes.append(f'prices: {_price_src}')
-    res = {'pick': None, 'main': main, 'reason': '', 'tie': False, 'guard': [], 'full': [], 'claude_L': None, 'codex_L': None,
+    res = {'pick': None, 'main': main, 'reason': '', 'tie': False, 'guard': [], 'sub_tight': [], 'full': [], 'claude_L': None, 'codex_L': None,
            'windows': {}, 'errors': errs, 'notes': notes}
     for side in states:
         for k, v in states[side].items():
             res['windows'][k] = {kk: (round(vv, 4) if isinstance(vv, float) else vv) for kk, vv in v.items()}
     if states['claude'] and states['codex']:
         pick, why = decide_states(states, main)
-        res.update(pick=pick, tie=why['tie'], guard=why['guard'], full=why['full'], claude_L=round(why['claude_L'], 4),
+        res.update(pick=pick, tie=why['tie'], guard=why['guard'], sub_tight=why['sub_tight'], full=why['full'], claude_L=round(why['claude_L'], 4),
                    codex_L=round(why['codex_L'], 4),
-                   reason=('full' if why['full'] else 'guard' if why['guard'] or why['sub_tight'] else 'tie' if why['tie'] else 'leftover'))
+                   reason=why['stage'])
         return res, 0
     if states['claude']:
         res.update(pick='claude', reason='codex_unreadable')
@@ -1385,7 +1470,8 @@ def print_human(res):
             extra += f'  {v["note"]}'
         print(f'  {k} ({win_label(v["win"])}): used {v["u"]:.0f}%  resets {f(v["r"])} (in {v["rem_h"]:.1f} h){extra}')
     if res['claude_L'] is not None:
-        print(f'  leftover probability Claude {res["claude_L"]:.2f} / Codex {res["codex_L"]:.2f}  guard {res["guard"] or "none"}  full {res["full"] or "none"}')
+        print(f'  leftover probability Claude {res["claude_L"]:.2f} / Codex {res["codex_L"]:.2f}  guard {res["guard"] or "none"}'
+              f'  sub_tight {res["sub_tight"] or "none"}  full {res["full"] or "none"}')
 
 
 def _arg(name):
@@ -1420,14 +1506,15 @@ def main():
         os.makedirs(DATA, exist_ok=True)
         with open(SAMPLE_STAMP, 'w') as f:
             f.write(f'{int(t)}\n')
-        print(f'windows recorded {len(rows)}  cost rows {added}' + (f'  errors: {errs}' if errs else '') + (f'  notes: {notes}' if notes else '')
+        usage_added = added.pop('usage', 0) if isinstance(added, dict) else 0
+        print(f'windows recorded {len(rows)}  cost rows {added}  usage rows from logs {usage_added}' + (f'  errors: {errs}' if errs else '') + (f'  notes: {notes}' if notes else '')
               + ('  weights relearned' if re_ else ''))
         sys.exit(0 if rows else 1)
     if cmd == 'calibrate':
+        if '--if-needed' in sys.argv:   # from install.sh: only when the weights are missing, old, or of a different form (if the records are long enough to learn from)
+            print('weights relearned' if maybe_calibrate(time.time()) else 'weights kept')
+            return
         calibrate()
-        return
-    if cmd == 'import':
-        import_history()
         return
     print(USAGE)
     sys.exit(0 if cmd in ('', '-h', '--help', 'help') else 2)

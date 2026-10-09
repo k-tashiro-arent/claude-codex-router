@@ -15,14 +15,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck
-        run: shellcheck install.sh uninstall.sh bootstrap.sh test/smoke.sh
+        run: shellcheck install.sh uninstall.sh bootstrap.sh test/smoke.sh examples/codex-offload/*.sh examples/claude-offload/*.sh
       - name: bash -n syntax check
         run: |
-          for f in install.sh uninstall.sh bootstrap.sh test/smoke.sh; do
+          for f in install.sh uninstall.sh bootstrap.sh test/smoke.sh examples/codex-offload/*.sh examples/claude-offload/*.sh; do
             bash -n "$f"
           done
 
-  # ruff はバージョンを固定する（未固定だと既定ルールの変更だけで CI が赤くなる）。検査対象は ruff.toml で固定
+  # pin the ruff version (unpinned, a change in the default rules alone turns CI red). What is checked is fixed in ruff.toml
   python-lint:
     name: python lint
     runs-on: ubuntu-latest
@@ -38,8 +38,8 @@ jobs:
           python -m pip install --quiet 'ruff==0.16.4'
           ruff check bin/ test/
 
-  # インストールからアンインストールまで（偽の HOME・codex・使用量 API・crontab）。
-  # ubuntu + macOS、install.sh を直接と、curl ワンライナーの経路（ローカルの checkout を clone）の両方
+  # from install to uninstall (fake HOME, codex, usage API, crontab).
+  # ubuntu + macOS, both install.sh directly and the curl one-liner path (cloning the local checkout)
   smoke:
     name: smoke (${{ matrix.os }} / ${{ matrix.mode }})
     strategy:

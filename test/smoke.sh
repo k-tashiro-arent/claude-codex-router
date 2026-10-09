@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# インストールからアンインストールまでの通しの確認（偽の HOME・偽の codex・偽の Claude の使用量 API・偽の crontab・
-# 偽の単価データ・偽の会話ログで、本物の環境に触れない）。CI と手元の両方で動く。
-#   SMOKE_INSTALL_MODE=direct（install.sh を直接）| bootstrap（このリポジトリを clone する経路）
-#   SMOKE_BOOTSTRAP_REF   bootstrap で clone するブランチ（既定 citest）
+# End-to-end check from install to uninstall (with a fake HOME, fake codex, fake Claude usage API, fake crontab,
+# fake price data and fake conversation logs; the real environment is not touched). Runs both in CI and locally.
+#   SMOKE_INSTALL_MODE=direct (install.sh directly) | bootstrap (the path that clones this repository)
+#   SMOKE_BOOTSTRAP_REF   branch that bootstrap clones (default citest)
 set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -19,31 +19,40 @@ export HOME="$work/home"
 export CLAUDE_CONFIG_DIR="$HOME/.claude"
 export CLAUDE_CODEX_ROUTER_DIR="$HOME/.claude/codex-router"
 export CLAUDE_CODEX_ROUTER_SCHEDULER=cron
+export CLAUDE_CODEX_ROUTER_SKILLS=none   # the installer does not ask about the skills (section 11 sets it)
 mkdir -p "$HOME/.claude" "$work/bin"
 DIR="$CLAUDE_CODEX_ROUTER_DIR"
 
-# 偽の crontab（$work/crontab.txt に読み書きする）
+# fake crontab (reads and writes $work/crontab.txt)
 cat > "$work/bin/crontab" <<EOF
 #!/usr/bin/env bash
 f="$work/crontab.txt"
 if [[ "\${1:-}" == "-l" ]]; then [[ -f "\$f" ]] && cat "\$f" || exit 1; else cat > "\$f"; fi
 EOF
-# 偽の codex（app-server の account/rateLimits/read だけ答える）
+# fake codex (answers only exec, for run.sh of the delegation example; usage is read without codex)
 cat > "$work/bin/codex" <<'EOF'
 #!/usr/bin/env python3
-import json, sys, time
-for line in iter(sys.stdin.readline, ''):   # for line in sys.stdin は先読みするので、入力が閉じるまで答えない
-    m = json.loads(line)
-    if m.get('id') == 1:
-        print(json.dumps({'id': 1, 'result': {}}), flush=True)
-    if m.get('id') == 2:
-        r = int(time.time()) + 3 * 86400
-        print(json.dumps({'id': 2, 'result': {'rateLimits': {'primary': {'usedPercent': 30, 'windowDurationMins': 10080, 'resetsAt': r}}}}), flush=True)
+import sys
+if sys.argv[1:2] == ['exec']:   # read the request and write the report to the -o file
+    sys.stdin.read()
+    open(sys.argv[sys.argv.index('-o') + 1], 'w').write('done\n')
+    sys.exit(0)
+sys.exit(2)
 EOF
-chmod +x "$work/bin/crontab" "$work/bin/codex"
+# fake claude (answers only -p, for run.sh of the claude-offload example)
+cat > "$work/bin/claude" <<'EOF'
+#!/usr/bin/env python3
+import json, sys
+if '-p' in sys.argv:
+    sys.stdin.read()
+    print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'result': 'done'}))
+    sys.exit(0)
+sys.exit(2)
+EOF
+chmod +x "$work/bin/crontab" "$work/bin/codex" "$work/bin/claude"
 export PATH="$work/bin:$PATH"
 
-# 偽の単価データ（LiteLLM の形。通信しない）と、偽の会話ログ（Claude・Codex それぞれ 1 応答）
+# fake price data (LiteLLM format; no network) and fake conversation logs (one response each for Claude and Codex)
 python3 - "$work/prices.json" <<'EOF'
 import json, sys
 d = {f'filler-{i}': {'input_cost_per_token': 1e-6} for i in range(120)}
@@ -58,15 +67,23 @@ printf '{"timestamp": "%s", "requestId": "r1", "message": {"id": "m1", "model": 
 { printf '{"timestamp": "%s", "type": "turn_context", "payload": {"model": "gpt-6.1-sol"}}\n' "$now_iso"
   printf '{"timestamp": "%s", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 1000, "cached_input_tokens": 500, "output_tokens": 10}}}}\n' "$now_iso"; } > "$HOME/.codex/sessions/2026/10/06/s.jsonl"
 
-# 偽の Claude の使用量 API（127.0.0.1 の空きポート）
+# fake Claude usage API and fake ChatGPT usage (a free port on 127.0.0.1)
 cat > "$work/server.py" <<'EOF'
 import datetime, http.server, json, os, sys
 WORK = sys.argv[1]
 class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
+        if self.path.startswith('/backend-api/wham/usage'):   # fake ChatGPT usage (Codex)
+            if self.headers.get('Authorization') != 'Bearer codex-token' or self.headers.get('ChatGPT-Account-Id') != 'acct-1':
+                self.send_response(401); self.end_headers(); return
+            r = int(datetime.datetime.now(datetime.timezone.utc).timestamp()) + 3 * 86400
+            b = json.dumps({'rate_limit': {'primary_window': {'used_percent': 30, 'limit_window_seconds': 604800, 'reset_at': r},
+                                           'secondary_window': None}}).encode()
+            self.send_response(200); self.send_header('Content-Type', 'application/json'); self.end_headers(); self.wfile.write(b)
+            return
         with open(os.path.join(WORK, 'hits'), 'a') as f:
             f.write('.')
-        if os.path.exists(os.path.join(WORK, '429')):   # このファイルがある間は 429 を返す
+        if os.path.exists(os.path.join(WORK, '429')):   # returns 429 while this file exists
             self.send_response(429); self.end_headers(); return
         if self.headers.get('Authorization') != 'Bearer test-token':
             self.send_response(401); self.end_headers(); return
@@ -89,10 +106,13 @@ server_pid=$!
 for _ in $(seq 50); do [[ -s "$work/port" ]] && break; sleep 0.1; done
 port="$(cat "$work/port")"
 export CLAUDE_CODEX_ROUTER_CLAUDE_URL="http://127.0.0.1:$port/api/oauth/usage"
+export CLAUDE_CODEX_ROUTER_CODEX_URL="http://127.0.0.1:$port/backend-api/wham/usage"
+mkdir -p "$HOME/.codex"
+printf '{"tokens": {"access_token": "codex-token", "account_id": "acct-1"}}\n' > "$HOME/.codex/auth.json"
 exp=$(( ($(date +%s) + 3600) * 1000 ))
 printf '{"claudeAiOauth": {"accessToken": "test-token", "expiresAt": %s}}\n' "$exp" > "$CLAUDE_CONFIG_DIR/.credentials.json"
 
-# 1) インストール
+# 1) install
 install_once() {
   if [[ "$MODE" == "bootstrap" ]]; then
     CLAUDE_CODEX_ROUTER_REPO="$SRC" CLAUDE_CODEX_ROUTER_REF="${SMOKE_BOOTSTRAP_REF:-citest}" bash "$SRC/bootstrap.sh" > "$work/install.log"
@@ -102,24 +122,25 @@ install_once() {
 }
 install_once
 for f in bin/router.py weights-default.json config.json uninstall.sh .version; do
-  [[ -f "$DIR/$f" ]] || fail "インストール後に $f が無い"
+  [[ -f "$DIR/$f" ]] || fail "$f missing after install"
 done
-[[ "$(grep -c '# claude-codex-router$' "$work/crontab.txt")" == 1 ]] || fail "crontab の行が 1 行でない"
-pass "install（$MODE）：ファイルと crontab の行"
+[[ "$(grep -c '# claude-codex-router$' "$work/crontab.txt")" == 1 ]] || fail "the crontab line is not exactly 1 line"
+grep -q "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR " "$work/crontab.txt" || fail "the crontab line has no CLAUDE_CONFIG_DIR"
+pass "install ($MODE): files and crontab line"
 
-# 2) 再インストール：設定は保つ・crontab の行は増えない
-echo '{"guard_risk": 0.7, "claude_min_interval": 0}' > "$DIR/config.json"   # 3)〜6) は毎回 API を呼ぶ
+# 2) reinstall: settings are kept, crontab lines do not increase
+echo '{"guard_risk": 0.7, "claude_min_interval": 0}' > "$DIR/config.json"   # 3) to 6) call the API every time
 install_once
-grep -q '0.7' "$DIR/config.json" || fail "再インストールで config.json が上書きされた"
-[[ "$(grep -c '# claude-codex-router$' "$work/crontab.txt")" == 1 ]] || fail "再インストールで crontab の行が増えた"
-pass "再インストール：設定を保ち、タイマーは重ならない"
+grep -q '0.7' "$DIR/config.json" || fail "reinstall overwrote config.json"
+[[ "$(grep -c '# claude-codex-router$' "$work/crontab.txt")" == 1 ]] || fail "reinstall added a crontab line"
+pass "reinstall: keeps the settings, timers do not stack"
 
-# 3) 両方読める：判断して記録する
+# 3) both readable: decides and records
 set +e
 out=$(python3 "$DIR/bin/router.py" now --json); code=$?
 set -e
-[[ $code == 0 ]] || fail "now --json の終了コード $code（$out）"
-python3 - "$out" <<'EOF' || fail "now --json の中身"
+[[ $code == 0 ]] || fail "now --json exit code $code ($out)"
+python3 - "$out" <<'EOF' || fail "now --json contents"
 import json, sys
 d = json.loads(sys.argv[1])
 w = d['windows']
@@ -127,60 +148,60 @@ assert d['pick'] in ('claude', 'codex') and d['main'] == 'claude', d
 assert set(w) == {'claude-session', 'claude-weekly_all', 'claude-weekly_scoped:Fable', 'codex-7d'}, w.keys()
 assert w['codex-7d']['u'] == 30 and w['claude-weekly_all']['u'] == 20 and w['claude-session']['win'] == 300
 assert w['claude-weekly_scoped:Fable']['scoped'] and not w['claude-weekly_all']['scoped']
-assert all(v['X'] is None for v in w.values())                      # 料金の記録が 1 日分に満たない（初めての環境）
-assert d['claude_L'] == 0.5 and d['codex_L'] == 0.5 and not d['errors']
-assert any('less than 1 day' in n for n in d['notes']), d['notes']
+assert all(v['X'] is None for v in w.values())                      # there are conversation logs, but the cost in the current windows is still 0 (no limit)
+assert d['claude_L'] == 0.5 and d['codex_L'] == 0.5 and not d['errors'] and d['sub_tight'] == [] and d['full'] == []
+assert 'limit unknown' in w['codex-7d']['note'], w['codex-7d']
 EOF
-[[ "$(wc -l < "$DIR/data/usage.jsonl")" -eq 4 ]] || fail "記録が 4 行でない"
+[[ "$(wc -l < "$DIR/data/usage.jsonl")" -eq 4 ]] || fail "the records are not 4 lines"
 out=$(python3 "$DIR/bin/router.py" now --json --main codex) || true
 python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["main"]=="codex", d' "$out" || fail "--main codex"
-python3 "$DIR/bin/router.py" now > /dev/null || fail "now（人向けの表示）"
-pass "now：両方を読んで判断し、記録した"
+python3 "$DIR/bin/router.py" now > /dev/null || fail "now (human-readable output)"
+pass "now: read both, decided, and recorded"
 
-# 4) 片側・両側が読めない
+# 4) one or both sides unreadable
 set +e
-out=$(CLAUDE_CODEX_ROUTER_CODEX=/nonexistent PATH="/usr/bin:/bin" python3 "$DIR/bin/router.py" now --json); code=$?
+out=$(CODEX_HOME="$work/no-codex" python3 "$DIR/bin/router.py" now --json); code=$?
 set -e
 if [[ $code != 1 ]] || ! python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["pick"]=="claude" and d["reason"]=="codex_unreadable" and d["errors"]' "$out"; then
-  fail "Codex が読めないとき（終了コード $code、$out）"
+  fail "when Codex is unreadable (exit code $code, $out)"
 fi
 mv "$CLAUDE_CONFIG_DIR/.credentials.json" "$work/cred.bak"
 set +e
-out=$(CLAUDE_CODEX_ROUTER_CODEX=/nonexistent PATH="/usr/bin:/bin" python3 "$DIR/bin/router.py" now --json); code=$?
+out=$(CODEX_HOME="$work/no-codex" python3 "$DIR/bin/router.py" now --json); code=$?
 set -e
 if [[ $code != 2 ]] || ! python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["pick"]=="codex" and d["reason"]=="both_unreadable" and len(d["errors"])==2' "$out"; then
-  fail "どちらも読めないとき（終了コード $code、$out）"
+  fail "when neither is readable (exit code $code, $out)"
 fi
 mv "$work/cred.bak" "$CLAUDE_CONFIG_DIR/.credentials.json"
-pass "読めない側があっても止まらず、終了コードで知らせる"
+pass "does not stop when a side is unreadable, and reports it in the exit code"
 
-# 5) sample（タイマーが呼ぶもの）
+# 5) sample (what the timer calls)
 n0=$(wc -l < "$DIR/data/usage.jsonl")
 python3 "$DIR/bin/router.py" sample > /dev/null || fail "sample"
-[[ "$(wc -l < "$DIR/data/usage.jsonl")" -eq $((n0 + 4)) ]] || fail "sample で 4 行増えない"
-[[ "$(wc -l < "$DIR/data/cost-claude.jsonl")" -eq 1 && "$(wc -l < "$DIR/data/cost-codex.jsonl")" -eq 1 ]] || fail "sample で料金の記録が会話ログから足されない"
-[[ -f "$DIR/data/litellm-prices.json" ]] || fail "sample で単価データの控えができない"
-python3 "$DIR/bin/router.py" sample > /dev/null || fail "2 回目の sample"
-[[ "$(wc -l < "$DIR/data/cost-claude.jsonl")" -eq 1 ]] || fail "2 回目の sample で料金の記録が重なった"
-pass "sample：使用率と料金を記録に足した（料金は重ねない）"
+[[ "$(wc -l < "$DIR/data/usage.jsonl")" -eq $((n0 + 4)) ]] || fail "sample does not add 4 lines"
+[[ "$(wc -l < "$DIR/data/cost-claude.jsonl")" -eq 1 && "$(wc -l < "$DIR/data/cost-codex.jsonl")" -eq 1 ]] || fail "sample does not add cost records from the conversation logs"
+[[ -f "$DIR/data/litellm-prices.json" ]] || fail "sample does not create the price data cache"
+python3 "$DIR/bin/router.py" sample > /dev/null || fail "second sample"
+[[ "$(wc -l < "$DIR/data/cost-claude.jsonl")" -eq 1 ]] || fail "second sample duplicated cost records"
+pass "sample: added usage and cost to the records (cost not duplicated)"
 
-# 6) Claude の API が 429：呼び直さず、記録の最新の値で判断する（借りた値は記録に足さない）
+# 6) Claude's API returns 429: no retry, decide from the latest recorded value (borrowed values are not added to the records)
 touch "$work/429"; : > "$work/hits"
 n0=$(wc -l < "$DIR/data/usage.jsonl")
 set +e
 out=$(python3 "$DIR/bin/router.py" now --json); code=$?
 set -e
 if [[ $code != 0 ]] || ! python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["pick"] in ("claude","codex") and not d["errors"] and "429" in d["notes"][0] and d["windows"]["claude-weekly_all"]["u"]==20 and d["claude_L"] is not None' "$out"; then
-  fail "429 のとき（終了コード $code、$out）"
+  fail "on 429 (exit code $code, $out)"
 fi
-[[ "$(wc -c < "$work/hits")" -eq 1 ]] || fail "429 のあと呼び直した（$(wc -c < "$work/hits") 回）"
-[[ "$(wc -l < "$DIR/data/usage.jsonl")" -eq $((n0 + 1)) ]] || fail "429 のとき Codex の 1 行だけ足すはず"
-python3 "$DIR/bin/router.py" sample > /dev/null || fail "429 のときの sample"
-[[ "$(wc -l < "$DIR/data/usage.jsonl")" -eq $((n0 + 2)) ]] || fail "429 のときの sample は Codex の 1 行だけ足すはず"
+[[ "$(wc -c < "$work/hits")" -eq 1 ]] || fail "called again after 429 ($(wc -c < "$work/hits") times)"
+[[ "$(wc -l < "$DIR/data/usage.jsonl")" -eq $((n0 + 1)) ]] || fail "on 429, only the 1 Codex line should be added"
+python3 "$DIR/bin/router.py" sample > /dev/null || fail "sample on 429"
+[[ "$(wc -l < "$DIR/data/usage.jsonl")" -eq $((n0 + 2)) ]] || fail "sample on 429 should add only the 1 Codex line"
 rm "$work/429"
-pass "429：呼び直さず、直近の記録で判断した"
+pass "429: no retry, decided from the recent record"
 
-# 6b) 直近の記録があれば Claude の API を呼ばない（借りた値は記録に足さない）
+# 6b) with a recent record, Claude's API is not called (borrowed values are not added to the records)
 echo '{"guard_risk": 0.7, "claude_min_interval": 60}' > "$DIR/config.json"
 r7=$(( $(date +%s) + 4 * 86400 ))
 printf '{"ts": %s, "side": "claude", "win": 10080, "u": 33.0, "r": %s, "src": "live"}\n' "$(date +%s)" "$r7" >> "$DIR/data/usage.jsonl"
@@ -190,24 +211,45 @@ set +e
 out=$(python3 "$DIR/bin/router.py" now --json); code=$?
 set -e
 if [[ $code != 0 ]] || ! python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert not d["errors"] and "API not called" in d["notes"][0] and d["windows"]["claude-weekly_all"]["u"]==33' "$out"; then
-  fail "直近の記録があるとき（終了コード $code、$out）"
+  fail "with a recent record (exit code $code, $out)"
 fi
-python3 "$DIR/bin/router.py" sample > /dev/null || fail "直近の記録があるときの sample"
-[[ ! -s "$work/hits" ]] || fail "直近の記録があるのに Claude の API を呼んだ（$(wc -c < "$work/hits") 回）"
-[[ "$(wc -l < "$DIR/data/usage.jsonl")" -eq $((n0 + 2)) ]] || fail "直近の記録があるときは now・sample とも Codex の 1 行だけ足すはず"
-pass "直近の記録があれば Claude の API を呼ばない"
+python3 "$DIR/bin/router.py" sample > /dev/null || fail "sample with a recent record"
+[[ ! -s "$work/hits" ]] || fail "called Claude's API despite a recent record ($(wc -c < "$work/hits") times)"
+[[ "$(wc -l < "$DIR/data/usage.jsonl")" -eq $((n0 + 2)) ]] || fail "with a recent record, now and sample should each add only the 1 Codex line"
+pass "with a recent record, Claude's API is not called"
 
-# 7) 単体テスト（リポジトリの test/ を、入れた router.py ではなくリポジトリの bin/ で）
-python3 -m unittest discover -s "$SRC/test" > "$work/unit.log" 2>&1 || { cat "$work/unit.log"; fail "単体テスト"; }
-pass "単体テスト"
+# 6c) delegation example (examples/codex-offload): pick.sh reads the installed router's decision, run.sh keeps the codex exec result
+EX="$SRC/examples/codex-offload"
+line=$(bash "$EX/pick.sh")
+[[ "$line" =~ ^(claude|codex)\ claude-codex-router: ]] || fail "pick.sh cannot read the router's decision ($line)"
+bash "$EX/test_pick.sh" > "$work/pick-test.log" || { cat "$work/pick-test.log"; fail "test_pick.sh"; }
+mkdir -p "$work/repo" && git -C "$work/repo" init -q && echo x > "$work/repo/a.txt"
+echo "read a.txt" | bash "$EX/run.sh" read "$work/repo" "$work/cx" > "$work/run.out" || fail "run.sh ($(cat "$work/run.out"))"
+if ! grep -q '^rc=0 mode=read' "$work/run.out" || [[ "$(cat "$work/cx/last.txt")" != "done" ]] || grep -q 'WARNING' "$work/run.out"; then
+  fail "run.sh summary ($(cat "$work/run.out"))"
+fi
+grep -q 'Standing rules' "$work/cx/prompt.md" || fail "run.sh did not prepend the preamble"
+EX2="$SRC/examples/claude-offload"
+{ cmp -s "$EX/pick.sh" "$EX2/pick.sh" && cmp -s "$EX/preamble.md" "$EX2/preamble.md"; } || fail "pick.sh / preamble.md differ between the two skills"
+line=$(bash "$EX2/pick.sh" --main codex)
+[[ "$line" =~ ^(claude|codex)\ claude-codex-router: ]] || fail "pick.sh --main codex cannot read the router's decision ($line)"
+echo "read a.txt" | bash "$EX2/run.sh" read "$work/repo" "$work/cl" > "$work/run2.out" || fail "claude-offload run.sh ($(cat "$work/run2.out"))"
+if ! grep -q '^rc=0 mode=read' "$work/run2.out" || [[ "$(cat "$work/cl/last.txt")" != "done" ]] || grep -q 'WARNING' "$work/run2.out"; then
+  fail "claude-offload run.sh summary ($(cat "$work/run2.out"))"
+fi
+pass "delegation examples: pick.sh reads the router, run.sh keeps the codex exec / claude -p result"
 
-# 8) アンインストール：タイマーと本体を外し、記録と設定は残す
+# 7) unit tests (the repository's test/, with the repository's bin/ rather than the installed router.py)
+python3 -m unittest discover -s "$SRC/test" > "$work/unit.log" 2>&1 || { cat "$work/unit.log"; fail "unit tests"; }
+pass "unit tests"
+
+# 8) uninstall: removes the timer and the program, keeps the records and settings
 bash "$DIR/uninstall.sh" > /dev/null
-grep -q '# claude-codex-router$' "$work/crontab.txt" && fail "アンインストール後も crontab の行が残る"
-[[ -f "$DIR/bin/router.py" ]] && fail "アンインストール後も router.py が残る"
-[[ -f "$DIR/data/usage.jsonl" && -f "$DIR/config.json" ]] || fail "アンインストールで記録・設定が消えた"
-pass "uninstall：タイマーと本体を外し、記録と設定は残した"
-# 9) systemd：linger を有効にし、ユーザーの systemd に繋がらなくても入れ終わる（WSL の再起動のあとの状態）
+grep -q '# claude-codex-router$' "$work/crontab.txt" && fail "the crontab line remains after uninstall"
+[[ -f "$DIR/bin/router.py" ]] && fail "router.py remains after uninstall"
+[[ -f "$DIR/data/usage.jsonl" && -f "$DIR/config.json" ]] || fail "uninstall deleted the records or settings"
+pass "uninstall: removed the timer and the program, kept the records and settings"
+# 9) systemd: enables linger, and finishes installing even when the user's systemd is unreachable (the state after a WSL restart)
 cat > "$work/bin/loginctl" <<EOF
 #!/usr/bin/env bash
 echo "\$*" >> "$work/loginctl.log"
@@ -222,30 +264,55 @@ echo "\$*" >> "$work/systemctl.log"
 [[ -f "$work/systemd-up" ]]
 EOF
 chmod +x "$work/bin/loginctl" "$work/bin/systemctl"
-CLAUDE_CODEX_ROUTER_SCHEDULER=systemd bash "$SRC/install.sh" > "$work/install-systemd.log" || fail "systemd に繋がらないと install が止まる"
-[[ -f "$DIR/.version" && -f "$DIR/uninstall.sh" ]] || fail "systemd に繋がらないとき、最後まで入れ終わらない"
-grep -q '^enable-linger ' "$work/loginctl.log" && [[ -f "$DIR/.linger" ]] || fail "linger を有効にしていない／印が無い"
-grep -q 'タイマーを登録できない' "$work/install-systemd.log" || fail "タイマーを登録できないことを知らせていない"
-[[ -f "$HOME/.config/systemd/user/claude-codex-router-sample.timer" ]] || fail "タイマーの定義が無い"
+CLAUDE_CODEX_ROUTER_SCHEDULER=systemd bash "$SRC/install.sh" > "$work/install-systemd.log" || fail "install stops when systemd is unreachable"
+[[ -f "$DIR/.version" && -f "$DIR/uninstall.sh" ]] || fail "when systemd is unreachable, install does not finish"
+grep -q '^enable-linger ' "$work/loginctl.log" && [[ -f "$DIR/.linger" ]] || fail "linger not enabled / no marker"
+grep -q 'timer could not be registered' "$work/install-systemd.log" || fail "does not report that the timer could not be registered"
+[[ -f "$HOME/.config/systemd/user/claude-codex-router-sample.timer" ]] || fail "no timer definition"
 : > "$work/systemd-up"
 : > "$work/loginctl.log"
-CLAUDE_CODEX_ROUTER_SCHEDULER=systemd bash "$SRC/install.sh" > "$work/install-systemd.log" || fail "systemd の再インストール"
-grep -q '^enable-linger ' "$work/loginctl.log" && fail "linger が有効なのに有効にし直した"
-grep -q 'enable --now claude-codex-router-sample.timer' "$work/systemctl.log" || fail "タイマーを有効にしていない"
+CODEX_HOME="$HOME/.codex" TOKEN_PACE_DIR="$HOME/tp" CLAUDE_CODEX_ROUTER_SCHEDULER=systemd bash "$SRC/install.sh" > "$work/install-systemd.log" || fail "systemd reinstall"
+grep -q "^Environment=CODEX_HOME=$HOME/.codex$" "$HOME/.config/systemd/user/claude-codex-router-sample.service" || fail "CODEX_HOME is not passed to the timer"
+grep -q "^Environment=TOKEN_PACE_DIR=$HOME/tp$" "$HOME/.config/systemd/user/claude-codex-router-sample.service" || fail "TOKEN_PACE_DIR is not passed to the timer"
+grep -q '^enable-linger ' "$work/loginctl.log" && fail "enabled linger again although it was already enabled"
+grep -q 'enable --now claude-codex-router-sample.timer' "$work/systemctl.log" || fail "the timer is not enabled"
 bash "$DIR/uninstall.sh" > /dev/null
-grep -q '^disable-linger ' "$work/loginctl.log" && [[ ! -f "$DIR/.linger" ]] || fail "uninstall で linger を戻していない"
-[[ ! -f "$HOME/.config/systemd/user/claude-codex-router-sample.timer" ]] || fail "uninstall でタイマーの定義が残る"
-pass "systemd：linger を有効にし、systemd に繋がらなくても入れ終わる。uninstall で戻す"
+grep -q '^disable-linger ' "$work/loginctl.log" && [[ ! -f "$DIR/.linger" ]] || fail "uninstall did not revert linger"
+[[ ! -f "$HOME/.config/systemd/user/claude-codex-router-sample.timer" ]] || fail "the timer definition remains after uninstall"
+pass "systemd: enables linger, finishes installing even when systemd is unreachable, reverted by uninstall"
 
-# 10) 定期の記録が止まっていれば now が知らせる
+# 10) now reports when periodic sampling has stopped (reinstalling checks the weights: the cost records are under 9 days, so nothing is learned)
 bash "$SRC/install.sh" > /dev/null
 python3 "$DIR/bin/router.py" sample > /dev/null || true
+bash "$SRC/install.sh" > "$work/install-w.log"
+grep -q '^  weights: weights kept$' "$work/install-w.log" || fail "install did not check the weights ($(grep weights "$work/install-w.log"))"
 touch -d '-2 hours' "$DIR/data/last-sample"
 out=$(python3 "$DIR/bin/router.py" now --json) || true
-python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert any("stopped" in n for n in d["notes"]), d["notes"]' "$out" || fail "定期の記録が止まっていることを知らせない"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert any("stopped" in n for n in d["notes"]), d["notes"]' "$out" || fail "does not report that periodic sampling has stopped"
 python3 "$DIR/bin/router.py" sample > /dev/null || true
 out=$(python3 "$DIR/bin/router.py" now --json) || true
-python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert not any("stopped" in n for n in d["notes"]), d["notes"]' "$out" || fail "定期の記録が動いているのに知らせた"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert not any("stopped" in n for n in d["notes"]), d["notes"]' "$out" || fail "reported although periodic sampling is running"
 bash "$DIR/uninstall.sh" > /dev/null
-pass "定期の記録が止まっていれば now が知らせる"
+pass "now reports when periodic sampling has stopped"
+
+# 11) delegation skills: installed when chosen, kept up to date, someone else's or edited ones are kept, removed by uninstall
+CS="$CLAUDE_CONFIG_DIR/skills/codex-offload"; XS="$HOME/.agents/skills/claude-offload"; RULES="$HOME/.codex/rules/claude-codex-router.rules"
+bash "$SRC/install.sh" > /dev/null
+[[ ! -e "$CS" && ! -e "$XS" && ! -e "$RULES" ]] || fail "skills installed although CLAUDE_CODEX_ROUTER_SKILLS=none"
+mkdir -p "$XS" && echo mine > "$XS/SKILL.md"                                  # someone else's skill under the same name
+CLAUDE_CODEX_ROUTER_SKILLS=both CLAUDE_CODEX_ROUTER_SKILLS_REPLACE=no bash "$SRC/install.sh" > "$work/install-sk.log"
+[[ -x "$CS/pick.sh" && -x "$CS/run.sh" ]] || fail "the Claude Code skill is not installed"
+[[ "$(cat "$XS/SKILL.md")" == mine && ! -e "$RULES" ]] || fail "replaced someone else's skill without being asked, or wrote the rule for it"
+grep -q "$CS/pick.sh --main claude" "$CS/SKILL.md" || fail "SKILL.md does not have the absolute path"
+CLAUDE_CODEX_ROUTER_SKILLS=codex CLAUDE_CODEX_ROUTER_SKILLS_REPLACE=yes bash "$SRC/install.sh" > "$work/install-sk.log"
+ls -d "$XS".bak-* > /dev/null 2>&1 || fail "the replaced skill was not moved aside"
+{ [[ -x "$XS/run.sh" ]] && grep -q "$XS/pick.sh --main codex" "$XS/SKILL.md"; } || fail "the Codex skill is not installed with the absolute path"
+grep -q "pattern=\[\"$XS/run.sh\"\], decision=\"allow\"" "$RULES" || fail "the Codex rule for run.sh is missing ($(cat "$RULES" 2>/dev/null))"
+echo "# my note" >> "$CS/SKILL.md"                                           # the user edits the Claude Code skill
+bash "$SRC/install.sh" > "$work/install-sk.log"
+{ grep -q 'was edited after install; kept as is' "$work/install-sk.log" && grep -q '# my note' "$CS/SKILL.md"; } || fail "overwrote an edited skill"
+bash "$DIR/uninstall.sh" > "$work/uninstall-sk.log"
+[[ ! -e "$XS" && ! -e "$RULES" ]] || fail "uninstall did not remove the Codex skill or the rule"
+{ [[ -f "$CS/SKILL.md" ]] && grep -q 'kept the skill' "$work/uninstall-sk.log"; } || fail "uninstall removed an edited skill"
+pass "skills: installed when chosen, edited or someone else's kept, removed by uninstall"
 echo "smoke: all passed"

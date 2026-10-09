@@ -1,182 +1,209 @@
 # claude-codex-router
 
-*日本語* ・ バージョン **0.1.0**（SemVer）
+*日本語* ・ バージョン **0.1.0**(セマンティック バージョニング)
 
-Claude Code と Codex CLI の両方を使うときに、**次の仕事をどちらに回すか**を、両方の使用枠（レート制限）の余裕から決める小さな道具です。
-「リセットまでに使い切れずに消える枠」を先に使い、「足りなくなりそうな枠」を避けます。
+Claude のプラン(Pro・Max など)と、Codex を含む ChatGPT のプラン(Plus・Pro など)を使っている人のための小さなツールです。どちらのプランにも、5 時間・1 週間のような期間ごとに使える量の上限があり(この README では「使用枠」と呼びます)、期間が終わる(リセットされる)と使った量は 0 に戻ります。このツールは、次の仕事を Claude と Codex のどちらに任せるとよいかを、今の使用率(使用枠のうち使った割合)・リセットまでの時間・溜めた記録からの予測をもとに判断して示します。
+
+## うれしいこと
+
+- **無駄になる使用量が減る。** このままだと余りそうな方に仕事を回すので、期間の終わりに使われないまま消える使用量が減ります。
+- **途中で止まりにくい。** 期間の終わりまでに上限に達しそうになったら、もう一方に回します。
+- **見比べなくて済む。** 任せるたびに今の使用率を読んで決めるので、自分で残りを確かめる必要がありません。Claude Code から Codex へ、Codex から Claude Code へ作業を任せるときに使うスキルも同梱しています(下の「移譲のスキル」)。
+
+## 仕組み(簡単に)
+
+- Claude と Codex の使用率と、会話ログから数えた料金(トークン数 × API の単価。実際の請求額ではありません)を、5 分おきに手元に溜めます。
+- 溜めたデータから、期間の終わりまでにどれだけ使うかを、確率の幅を持たせて予測します。そのうえで、上限に達しそうな方を避け、余りそうな方に仕事を回します。
+
+## 出力の例
 
 ```
 $ python3 ~/.claude/codex-router/bin/router.py now
-判断: claude（使い残す確率。主側 claude）
-  claude-session（5h）: 使用 12%  リセット 10-09 02:10（あと 3.0 時間）  上限 $131（今の枠の分）  残り $115・使い切る確率 0.00
-  claude-weekly_all（7d）: 使用 30%  リセット 10-14 15:00（あと 135.8 時間）  上限 $1,027（今の枠の分）  残り $719・使い切る確率 0.48
-  claude-weekly_scoped:Fable（7d）: 使用 0%  リセット 10-14 15:00（あと 135.8 時間）  モデルを限った枠（表示だけ、判定に使わない）
-  codex-7d（7d）: 使用 38%  リセット 10-14 12:30（あと 133.4 時間）  上限 $241（今の枠の分）  残り $149・使い切る確率 0.72
-  使い残す確率 Claude 0.52 / Codex 0.28  歯止め なし  満杯 なし
+pick: codex (reason leftover, main claude)
+  claude-session (5h): used 24%  resets 10-09 13:19 (in 2.7 h)  limit $208 (current window)  remaining $158, exhaust probability 0.03
+  claude-weekly_all (7d): used 38%  resets 10-14 14:59 (in 124.4 h)  limit $1,094 (current window)  remaining $678, exhaust probability 0.50
+  claude-weekly_scoped:Fable (7d): used 0%  resets 10-14 15:00 (in 124.4 h)  model-scoped window (shown only, not used for the decision)
+  codex-7d (7d): used 51%  resets 10-14 12:30 (in 121.9 h)  limit $242 (current window)  remaining $119, exhaust probability 0.47
+  leftover probability Claude 0.50 / Codex 0.53  guard none  sub_tight none  full none
 ```
-
-## 主側と移譲先
-
-主に使う側（主側）を `--main claude|codex`（または設定の `main`、既定 `claude`）で決めます。もう片方が移譲先です。
-Claude を主に使って Codex にサブ処理を渡す人も、Codex を主に使って Claude に渡す人も使えます。
-
-## 枠
-
-API が返す枠をすべて扱います。枠の数・長さ・上限は変わる前提です。
-
-- Claude：使用量の API が返す枠の一覧（5 時間の `session`、7 日の `weekly_all` など）。知らない種類の枠は判断に使わず、注記に出します。
-  モデルを限った枠（例：Fable だけを数える 7 日枠）は表示だけで、判断には使いません（その枠で作業が止まるかは、そのモデルを使っているかで決まり、この道具には分からないため）。
-- Codex：`codex app-server` が返す枠（長さも API が返します）。
-
-## 使い切る確率
-
-使用量は**料金（USD）**で数えます：会話ログのトークン数 × モデル別の単価。
-
-- **単価**：動作時に [LiteLLM の単価データ](https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json)から取り、手元に控えます（1 日 1 回取り直し、取れないときは控えを使います）。設定の `prices` でモデルごとに上書きできます。単価の無いモデルは 0 として数え、注記に出します。
-- **上限の金額**（枠ごとに、動作時に推定します）：
-  - 使用率 u が 10% 以上なら、今の枠の分：枠の始まり（リセット − 枠の長さ）から今までの料金 ÷ u。
-  - それ未満なら、記録の分：今から 1 時間ずつさかのぼり、使用率の伸びがその枠 1 つ分（100%）になるまでの料金 ÷ 使用率の伸び。
-  - 上限が変われば、その枠 1 つ分を使ううちに新しい値に移ります。
-- **これから使う料金の分布**：過去の料金（15 分ごと）から、今からリセットまでに使う料金 S の分布を作ります。
-  - 24 時間先まで：似た時点のその後・同じ時刻の実績・「使うか」×「いくら使うか」のシミュレーション・同じ時刻の実績を直前 7 日／3 日の水準で割り戻したもの・日の合計の見込みを時刻で割り振ったもの、を混ぜます。混ぜる割合は、その環境の記録から 1 日 1 回学び直します（学べるまでは同梱の割合）。
-  - それより先：似た時点のその後・直前 7 日の水準で割り戻したもの・日の合計の見込み、を同じ割合で混ぜます。
-  - 休日（土日と設定の `holidays`）は平日と分けて扱います。
-- **使い切る確率 X**（次のリセットまでに上限に達する確率）＝ P(S ≥ 上限 × (1 − u/100))。**使い残す確率**＝ 1 − X。
-- 料金の記録が 1 日分に満たない側は、X を出しません（判断ではその枠を見ません）。記録が先の時間より短いあいだは、その時間の実績が要る見込みを外して混ぜます。
-  見込みの当たり具合を確かめたのは、料金の記録が 2 週間分以上あるときだけです。
-
-## 判断のしかた
-
-次の順に決めます。先の段で決まれば、後の段は見ません。
-
-### 1. 上限
-
-片方だけがどれかの枠で上限（`full`、既定 98%）に達していれば、もう片方に回します。両方が達しているときは次の段へ進みます。
-
-### 2. 歯止め
-
-主側のどれかの枠で使い切る確率 X が `guard_risk`（既定 0.5）を超えるなら、移譲先に回します。
-主側が上限に達すると、主側で作業を回している側も止まるためです（移譲先が上限に達しても、主側に戻せば作業は続きます）。
-移譲先の短い枠（1 日未満）の X が `guard_risk` を超えるなら、主側に回します。
-
-### 3. 使い残す確率の比較
-
-長い枠（1 日以上）の使い残す確率の、各側の最小のものを比べ、大きい側に回します。短い枠はこの比較に入れません。
-
-- 読み方：使い残す確率が 0.9 なら、これまでと同じように使うと 9 割の見込みで使い残すので、その枠を先に使うほど消える枠が減ります。0.1 なら、9 割の見込みで使い切ります。
-- 両方がちょうど等しければ `tie_default`（既定 codex）。X の出せる長い枠が無い側は 0.5 とみなします。
-- 確率は標本で数えるので、±0.03 程度の揺れがあります（同じ入力なら同じ値です）。直前の使い方で見込みが変わるため、使い方にむらのある側は 15 分ごとに値が大きく動くことがあります。
+1 行目が判断(ここでは Codex)です。その下の行は、使用枠ごとの今の使用率(`used`)、リセットの時刻(`resets`)、推定した上限の金額(`limit`。かっこは出し方で、`current window` は今の使用枠の料金から、`history` は過去の記録から)、上限までの残りの金額(`remaining`)、使い切る確率(リセットまでに上限に達する確率。`exhaust probability`)です。
+最後の行は、Claude・Codex それぞれの使い残す確率(1 − 使い切る確率)と、判断を決めた使用枠です。`guard`・`sub_tight` は歯止め(上限に達しそうな側を避ける判断)で決めた使用枠、`full` は満杯(使用率が 98% 以上)の使用枠です(下の「判断のしかた」)。読めなかったことや注記があれば、`error:`・`note:` の行が出ます。
+この例では、移譲元(Claude。下の「移譲元と移譲先」)の使い切る確率がどの使用枠でも 0.5 を超えていないので、1 週間の使用枠の使い残す確率(`leftover probability`)の高い Codex に回しています。
 
 ## 動作環境
 
-- **OS**：Linux／WSL2。macOS は試験的な対応です（下の「macOS について」）。Windows ネイティブは対象外。
-- **依存**：`python3`（3.8 以上。標準ライブラリだけ）。
-- **Claude**：使用量の上限があるサブスクリプション（Pro／Max／Team など）で Claude Code にログインしていること。
-- **Codex**：Codex CLI（`codex`）が入っていること。無ければ Codex 側は読めません（判断は Claude を返します）。
+- **OS**：Linux/WSL2。macOS は試験的な対応です(下の「macOS について」)。Windows ネイティブは対象外。
+- **依存**：`python3`(3.8 以上。標準ライブラリだけ)。移譲のスキルを使うときは、移譲先のコマンド(`codex` か `claude`)も要ります。
+- **Claude**：使用枠がある Claude のプラン(Pro・Max・Team など)で Claude Code にログインしていること。API キーで使っている場合は対象外です(期間ごとの上限がありません)。
+- **Codex**：使用枠がある ChatGPT のプラン(Plus・Pro など)で Codex にログインしていること。API キーで使っている場合は対象外です(期間ごとの上限がありません)。
+
+一方の使用率を読めないときは、読めた方を選びます(下の「判断のしかた」)。
 
 ## インストール
 
-### 方法 A：ワンライナー
+次のどちらかで入れます。どちらも、最後にリポジトリの `install.sh`(インストーラ)を実行します。
+
+### 方法 A：ワンライナー(リポジトリを手元に残さない)
 ```bash
 curl -fsSL https://raw.githubusercontent.com/k-tashiro-arent/claude-codex-router/main/bootstrap.sh | bash
 ```
-固定版は `CLAUDE_CODEX_ROUTER_REF=v0.1.0` を付けます。
+`bootstrap.sh` を取ってきて実行します。`bootstrap.sh` は、このリポジトリを一時ディレクトリに `git clone` し、その中の `install.sh` を実行して、終わると一時ディレクトリを消します(`git` が必要です)。
 
-### 方法 B：git clone
+既定では、`main` ブランチの最新を入れます。決まった版を入れたいときは、ブランチ・タグ・コミットを `CLAUDE_CODEX_ROUTER_REF` で指定します。指定は `bash` の側に付けます。指定した版が見つからないときは、警告を出したうえで `main` の最新を入れます。
+```bash
+curl -fsSL https://raw.githubusercontent.com/k-tashiro-arent/claude-codex-router/main/bootstrap.sh | CLAUDE_CODEX_ROUTER_REF=<ブランチ・タグ・コミット> bash
+```
+更新するときは、同じワンライナーを実行し直します(設定と記録は残ります)。
+
+### 方法 B：git clone(リポジトリを手元に残す)
 ```bash
 git clone https://github.com/k-tashiro-arent/claude-codex-router.git
 cd claude-codex-router
 ./install.sh
 ```
+更新するときは、`git pull` してから `./install.sh` を実行し直します。
 
-インストーラは次を行います。
+### インストーラがすること
 
-1. `router.py` と、混ぜる割合の既定（`weights-default.json`）を `~/.claude/codex-router/` に置く（`CLAUDE_CODEX_ROUTER_DIR` で変更可）。
-2. 既定の `config.json` を置く（既にあれば上書きしない）。
-3. 5 分おきに使用量を記録するタイマーを置く。使えるものを次の順で 1 つ選びます（`CLAUDE_CODEX_ROUTER_SCHEDULER=systemd|launchd|cron|none` で指定可）。
-   - systemd のユーザータイマー（`claude-codex-router-sample.timer`）。linger も有効にします（下の「定期の記録」）
-   - macOS の launchd（`~/Library/LaunchAgents/io.github.k-tashiro-arent.claude-codex-router.plist`）
-   - crontab（`# claude-codex-router` の印の付いた 1 行）
+どちらの方法でも、インストーラ(`install.sh`)は次を行います。
 
-タイマーから `codex` を見つけられるよう、インストール時の `codex` の場所を PATH に書き込みます。`codex` を入れ直した・node の版を変えたときは、`install.sh` を再実行してください。
+1. `router.py` と、予測の方法を混ぜる割合の既定(`weights-default.json`)を `~/.claude/codex-router/` に置く(置き場は `CLAUDE_CODEX_ROUTER_DIR` で変えられます。下の「環境変数」)。
+2. 既定の `config.json` を置く(既にあれば上書きしない)。
+3. 5 分おきに使用率と料金を記録するタイマーを置く。使えるものを次の順で 1 つ選びます(`CLAUDE_CODEX_ROUTER_SCHEDULER` で指定もできます)。
+   - systemd のユーザータイマー(`claude-codex-router-sample.timer`):そのコンピューターが systemd で起動しているとき。**linger も有効にします**(下の「定期の記録」)。
+   - macOS の launchd(`~/Library/LaunchAgents/io.github.k-tashiro-arent.claude-codex-router.plist`)
+   - crontab(`# claude-codex-router` の印の付いた 1 行):`crontab` コマンドがあるとき。cron が動いているかは確かめないので、動いていることを確かめてください。
+   - どれも使えなければタイマーは置かず、警告を出します。そのときは `router.py sample` を自分で 5 分おきに呼んでください。
 
-### 定期の記録
+   タイマーはシェルの環境変数を引き継がないので、インストール時の `CODEX_HOME`・`CLAUDE_CONFIG_DIR`・`TOKEN_PACE_DIR`・`CLAUDE_CODEX_ROUTER_DIR` の値をタイマーに書き込みます。値を変えたら `install.sh` を実行し直してください。
+4. 更新・再インストールのときは、学んだ混ぜる割合が無い・今の版の予測の方法と合わない・1 日より古いなら、その場で学び直す(Claude の料金の記録が約 9 日分以上あるとき。数十秒)。
+5. 移譲のスキルを入れるかを聞き、選んだものを入れる(下の「移譲のスキル」の「入れ方」)。
 
-- systemd では、インストーラが **linger を有効にします**（`loginctl enable-linger`）。linger が無いと、ユーザーの systemd はログインしたときにしか立ち上がりません。WSL を再起動したあと、ログインせずに Claude Code などを動かしている間は、タイマーが動かないままになります。
-  - linger を有効にしたのがインストーラなら、`uninstall.sh` が無効に戻します。前から有効だったときは触りません。
-  - 有効にできなかったとき・ユーザーの systemd に繋がらなかったときも、インストールは最後まで行い、手で打つコマンドを表示します。
-- WSL（やマシン）が止まっている間は、何も記録されません。起動したあと、止まっていた間の分としてタイマーが 1 回だけ動きます。
-- `now` は、呼ばれるたびに使用率と料金を記録に足します。そのため、タイマーが止まっていても判断は続けられます。ただし、混ぜる割合の学び直し・単価の更新が遅れ、使用率の記録に穴が空きます。タイマーが 30 分を超えて止まっていると、`now` の `notes` に書きます。
-- 確かめるには：`systemctl --user list-timers | grep codex`（systemd）、または `~/.claude/codex-router/data/last-sample` の時刻（最後に `sample` が動いた時刻）を見ます。
+### 入れた直後
 
-過去の記録を取り込むと、すぐに自分の記録で判断できます。
+最初の `now`(か、タイマーの最初の `sample`)は、このコンピューターに残っている会話ログを全部読みます(1 回だけ。数十秒かかることがあります)。記録は空からではなく、残っている会話ログの分から始まります。
+移譲のスキルの `pick.sh`(下の「移譲のスキル」)は 90 秒で待つのをやめて `codex` を返すので、入れたら一度 `now` を実行しておくと確実です。
+
+## アンインストール
 ```bash
-python3 ~/.claude/codex-router/bin/router.py import   # 会話ログの料金・~/.codex/sessions のログの使用率・claude-token-pace の記録（在れば）
+bash ~/.claude/codex-router/uninstall.sh
 ```
-取り込まなくても、最初の `sample`（タイマー）が会話ログの料金を読み込みます。
+タイマーと `router.py` を外します。linger を有効にしたのがインストーラなら無効に戻し、前から有効だったときは触りません。記録と設定(`data/` と `config.json`)は残します(完全に消すには `rm -rf ~/.claude/codex-router`)。置き場を変えていたときは、同じ `CLAUDE_CODEX_ROUTER_DIR` を付けて実行します。
+インストーラが入れた移譲のスキルと Codex の規則も外します。入れたあとに書き換えたスキルは残して知らせるので、要らなければ自分で消してください。`CLAUDE.md`・`AGENTS.md` に書いた行と、手で写したスキルも自分で消します(残すと `pick.sh` がいつも `codex` を返します)。
 
 ## 使い方
 
+表の `router.py` は `python3 ~/.claude/codex-router/bin/router.py` の略です。
+
 | コマンド | すること |
 |---|---|
-| `router.py now [--main claude\|codex]` | 両方を読んで判断を表示し、記録にも足す |
-| `router.py now --json [--main claude\|codex]` | 同じ判断を JSON で（他の道具から使う） |
-| `router.py sample` | 両方を読んで記録に足し、会話ログの料金を料金の記録に足す（タイマーが呼ぶ） |
-| `router.py calibrate` | 料金の記録から混ぜる割合を学び直す（`sample` が 1 日 1 回呼ぶ） |
-| `router.py import` | この環境にある過去の記録を取り込む（重複は足さない） |
+| `router.py now [--main claude\|codex]` | Claude と Codex の今の使用率を読み、どちらに任せるかを表示する(読んだ使用率と、会話ログの増えた分の料金は記録にも足す) |
+| `router.py now --json [--main claude\|codex]` | 同じ判断を JSON で(他のツールから使う) |
+| `router.py sample` | Claude と Codex の今の使用率を読んで記録に足し、会話ログから料金を記録に足す(タイマーが 5 分おきに呼ぶ) |
+| `router.py calibrate [--if-needed]` | 料金の記録から混ぜる割合を学び直す(`sample` が 1 日 1 回呼ぶ)。`--if-needed` は、混ぜる割合が無い・1 日より古い・今の版の予測の方法と合わないときだけ(`install.sh` が呼ぶ) |
 
-`now` の終了コード：`0` 両方読めた／`1` 片方だけ読めた（読めた側を返す）／`2` どちらも読めない（`tie_default` を返す）。
+### 移譲元と移譲先
 
-`now --json` の形（値は例。`windows` は枠ごと）：
+移譲元(仕事を任せる元)を `--main claude|codex`(または設定の `main`、既定 `claude`)で決めます。もう一方が移譲先(仕事を任せる先)です。
+Claude を主に使い、仕事の一部を Codex に任せる人も、その逆の人も使えます。
+
+### 他のツールから使う(`now --json`)
+
+`now` の終了コード：`0` Claude と Codex の使用率をどちらも読めた/`1` 一方だけ読めた(読めた方を返す)/`2` どちらも読めない(設定の `tie_default` を返す。下の「設定」)。ほかに、`--main` の値が違うときと知らないコマンドは `2`、予期しないエラーで止まったときは `1` を返します。
+
+`now --json` の形(値は例。`windows` は使用枠ごと)：
 ```json
-{"pick": "claude", "main": "claude", "reason": "leftover", "tie": false, "guard": [], "full": [],
- "claude_L": 0.515, "codex_L": 0.28,
- "windows": {"claude-session": {"u": 12.0, "r": 1791479400, "win": 300, "scoped": false, "X": 0.0,
-                                "limit_usd": 131.15, "limit_src": "now", "remain_usd": 115.41, "rem_h": 3.01}, "...": {}},
- "errors": [], "notes": []}
+{"pick": "codex", "main": "claude", "reason": "leftover", "tie": false, "guard": [], "sub_tight": [], "full": [],
+ "claude_L": 0.5, "codex_L": 0.5325,
+ "windows": {"claude-session": {"u": 24.0, "r": 1791519599, "win": 300, "scoped": false, "X": 0.0275,
+                                "limit_usd": 207.6129, "limit_src": "now", "rem_h": 2.6989, "remain_usd": 157.7858}, "...": {}},
+ "errors": [], "notes": ["Claude: used the record from 10:37:12 (within 60 s; API not called)"]}
 ```
-`reason` は次のどれかです：`full`（満杯）・`guard`（歯止め）・`tie`（差なし）・`leftover`（使い残す確率の比較）・`codex_unreadable`（Codex が読めない）・`claude_unreadable`（Claude が読めない）・`both_unreadable`（どちらも読めない。`tie_default` を返す）。
-判定器の出力（`now`・`sample` などの表示、`errors`・`notes`・`note` の文）は英語です。
-`limit_src` は上限の出し方（`now` 今の枠の分／`hist` 記録の分）です。
+- `reason` は次のどれかです：`full`(満杯)・`guard`(歯止め。下の「判断のしかた」の 2)・`tie`(差なし)・`leftover`(使い残す確率の比較)・`codex_unreadable`(Codex が読めない)・`claude_unreadable`(Claude が読めない)・`both_unreadable`(どちらも読めない。`tie_default` を返す)。
+- `guard` は、移譲元で使い切る確率が設定の `guard_risk`(既定 0.5)を超えたので移譲先に回した、その使用枠です。`sub_tight` は、移譲先の短い使用枠(1 日未満)でその確率が `guard_risk` を超えたので移譲元に残した、その使用枠です。どちらも、判断がその段で決まったときだけ入ります。`full` は、使用率が設定の `full`(既定 98%)以上の使用枠の一覧です(判断がどの段で決まったかに関係なく、すべて入ります)。
+- `claude_L`・`codex_L` は Claude・Codex それぞれの使い残す確率です(一方しか読めないときは `null`)。
+- 使用枠ごとの値：`u` 使用率(%)、`r` リセットの時刻(Unix 時刻・秒)、`win` 使用枠の長さ(分)、`scoped` モデルを限った使用枠か、`X` 使い切る確率、`limit_usd` 上限の金額(USD)、`limit_src` 上限の出し方(`now` 今の使用枠の料金から/`hist` 過去の記録から)、`rem_h` リセットまでの時間、`remain_usd` 上限までの残りの金額(USD)、`note` その使用枠の注記。
+- このツールの表示(`router.py` の `now`・`sample` などの表示と `errors`・`notes`・`note` の文、インストーラ・アンインストーラ・移譲のスキルの表示)は英語です。
+
+## 移譲のスキル
+
+作業を切り出して任せるときに、このツールの判断に従って移譲先を選ぶスキルを 2 つ同梱しています。インストーラが入れるかを聞きます(下の「入れ方」)。
+
+| スキル | 使うもの | 移譲元 → 移譲先 | 置き場 |
+|---|---|---|---|
+| `codex-offload` | Claude Code | Claude Code → Codex(`codex exec`)か Claude のサブエージェント | `~/.claude/skills/codex-offload/`(`CLAUDE_CONFIG_DIR` を変えていればその下の `skills/`) |
+| `claude-offload` | Codex | Codex → Claude Code(`claude -p`)か Codex 自身 | `~/.agents/skills/claude-offload/` |
+
+どちらも中身は同じ作りです。
+- `pick.sh`：移譲のたびに呼び、`now --json` の判断を英語の 1 行(`<codex|claude> <理由>`)で返します。移譲元を `--main claude` / `--main codex` で渡します。このツールが入っていない・答えないときは `codex` を返します(Claude Code からは Codex に渡し、Codex は自分で行います)。
+- `run.sh`：移譲先に 1 回だけ渡し、依頼文・結果・変更ファイルを残します。`read` は読み取りのみ、`write` は編集とコマンドの実行あり。
+  - `codex-offload`:`codex exec` に渡します(`read` は `-s read-only`、`write` は `-s workspace-write`)。
+  - `claude-offload`:`claude -p` に渡します(`read` は読み取りと検索だけ、`write` は `--permission-mode bypassPermissions` でファイルの編集もコマンドの実行も確かめずに行います)。
+- `preamble.md`：移譲先に渡す依頼の前に付ける規則と、報告の形。
+- `SKILL.md`：移譲元が従う手順(移譲先の選び方・依頼本文に書くこと・結果の検証)。
+
+`pick.sh` の出力の例：
+```
+codex claude-codex-router: leftover (leftover probability Claude 0.50 / Codex 0.53)
+claude claude-codex-router: guard (leftover probability Claude 0.40 / Codex 0.50); kept on main (sub side short window): codex-5h
+```
+
+### 入れ方
+
+インストーラ(`install.sh`)が、スキルごとに入れるかを聞きます。聞かずに決めるには `CLAUDE_CODEX_ROUTER_SKILLS=claude|codex|both|none` を付けます(`claude` は `codex-offload`、`codex` は `claude-offload`)。方法 A(`curl … | bash`)でも、答えは端末から読みます。端末が無いとき(CI など)は、聞かずに入れません。
+- 同じ名前のスキルがすでにあれば、置き換えるかを聞きます(`CLAUDE_CODEX_ROUTER_SKILLS_REPLACE=yes|no` でも決められます)。置き換えるときは、元のものを `<置き場>.bak-<日時>` に移します。
+- インストーラが入れたスキルは、更新・再インストールのときに新しい版に入れ替えます。入れたあとに書き換えたスキルは、入れ替えずに残して知らせます。
+- `SKILL.md` の中のパスは、入れた場所の絶対パスに書き換えます。
+- `claude-offload` を入れると、Codex の規則 `~/.codex/rules/claude-codex-router.rules`(`CODEX_HOME` を変えていればその下)も書きます。Codex のサンドボックスの中では、ネットワークと `~/.claude` が使えず、判定器も Claude Code も動かないためです。この規則は、このスキルの `pick.sh` と `run.sh` の 2 つだけを、聞かずにサンドボックスの外で動かすことを許します。規則を読み込むには Codex を起動し直します。
+
+スキルを使わせるには、移譲元の指示のファイルに、たとえば次の 1 行を書きます(インストーラも表示します)。
+- Claude Code:`~/.claude/CLAUDE.md` に `- When you split off work and delegate it, follow the codex-offload skill.`
+- Codex:`~/.codex/AGENTS.md` に `- When you split off work and delegate it, follow the claude-offload skill.`
+
+スキルを使うかどうかは、Claude Code・Codex がこの指示に従うかで決まり、hook のように強制はされません。中身(規則・報告の形・検証のしかた)は、自分の使い方に合わせて書き換えてください(書き換えたスキルは、インストーラが上書きしません)。
+
+手で入れるときは、リポジトリの中で `examples/codex-offload` を Claude Code のスキルの置き場へ、`examples/claude-offload` を `~/.agents/skills/` へ写します。この場合、`SKILL.md` のパスの書き換えと Codex の規則は自分で行います。
 
 ## 設定
 
 `~/.claude/codex-router/config.json`
 | キー | 既定 | 意味 |
 |---|---|---|
-| `main` | `claude` | 主側（`--main` で上書き） |
-| `guard_risk` | 0.5 | 主側のどれかの枠の「使い切る確率」がこれを超えたら主側に回さない |
-| `tie_default` | `codex` | 両方の使い残す確率がちょうど等しいときの側 |
-| `full` | 98 | これ以上の使用率の側は使えないとみなす |
-| `claude_min_interval` | 60 | この秒数以内に読んだ Claude の記録があれば、Claude の使用量の API を呼ばずにそれを使う（0 で無効） |
-| `holidays` | `[]` | 土日のほかに休日として扱う日（`"YYYY-MM-DD"` の一覧） |
-| `prices` | `{}` | 単価の上書き。モデル名ごとに 100 万トークンあたりの USD：`in`（入力）・`out`（出力）・`cw5m`・`cw1h`（キャッシュ書き込み 5 分・1 時間）・`cr`（キャッシュ読み込み） |
+| `main` | `claude` | 移譲元(`--main` で上書き) |
+| `guard_risk` | 0.5 | 移譲元のどれかの使用枠の「使い切る確率」がこれを超えたら、移譲先に回す。移譲先の 1 日未満の使用枠でこれを超えたら、移譲元に残す |
+| `tie_default` | `codex` | Claude と Codex の使い残す確率がちょうど等しいとき、およびどちらも読めないときに任せる方 |
+| `full` | 98 | 使用率がこれ以上の使用枠を満杯とみなす。Claude と Codex の一方だけに満杯の使用枠があれば、もう一方に回す |
+| `claude_min_interval` | 60 | この秒数以内に読んだ Claude の記録があれば、Claude の使用率の API を呼ばずにそれを使う(0 で無効) |
+| `holidays` | `[]` | 土日のほかに休日として扱う日(`"YYYY-MM-DD"` の一覧) |
+| `prices` | `{}` | 単価の上書き。会話ログに書かれたモデル名ごとに、100 万トークンあたりの USD：`in`(入力)・`out`(出力)・`cw5m`・`cw1h`(キャッシュ書き込み 5 分・1 時間)・`cr`(キャッシュ読み込み) |
 
-## 記録とデータの扱い
+`prices` の例(LiteLLM の単価データに無いモデルを足す)。書かなかったキーは、LiteLLM にあるモデルならその値、無いモデルなら `in` と同じとみなします。
+```json
+{"prices": {"my-model": {"in": 3, "out": 15, "cw5m": 3.75, "cw1h": 6, "cr": 0.3}}}
+```
 
-- 記録は `~/.claude/codex-router/data/` に溜まります。
-  - `usage.jsonl`：使用率（1 行＝1 つの枠を 1 回読んだ値。5 分おきで 1 日に 1,000 行強）。
-  - `cost-claude.jsonl`・`cost-codex.jsonl`：会話ログから写したトークン数（料金は単価から都度計算します）。Claude Code の会話ログは既定で 30 日たつと消えるので、読んだ分をここに溜めます。
-  - `litellm-prices.json`：単価データの控え。`weights.json`：学んだ混ぜる割合。
-- 料金はこの環境の会話ログの分だけです。ほかの端末・claude.ai・Web で使った分は入りません（上限の金額を低く見積もる向きに効きます）。
-- 複数の Claude Code のセッションが書いた記録（claude-token-pace からの取り込み）には、新しい値の間に古い値が混ざります。使用率が下がった値は古い値として除き、0 近くまで戻ってそのまま続くときだけ、枠の途中のリセットとみなします。
-- 外へ出るのは次の読み取りだけです。使用量の読み取りはどちらもモデルを呼ばないので、使用枠は減りません。
-  - Claude：`GET https://api.anthropic.com/api/oauth/usage`（Claude Code の `/usage` と同じ）。
-  - Codex：`codex app-server` の `account/rateLimits/read`（`codex` 自身が通信します）。
-  - 単価：LiteLLM の単価データ（GitHub から 1 日 1 回）。
-- Claude の使用量の API は、短い間に続けて呼ぶと 429（呼び過ぎ）を返します。そのため次のようにします。どちらの場合も、そのことを `notes` に書き、`sample` はその回の Claude を記録しません。
-  - `claude_min_interval` 秒（既定 60 秒）以内に読んだ記録があれば、API を呼ばずにそれを使います。
-  - それでも 429 が返ったときは、呼び直さず、記録にある 10 分以内の最新の値を使います。10 分以内の記録が無ければ、Claude は読めなかった扱いです。
-- Claude のトークンは `$CLAUDE_CONFIG_DIR`（既定 `~/.claude`）の `.credentials.json` を**読むだけで、更新しません**（更新すると Claude Code 本体の認証を壊しうるため）。
+### 環境変数
+
+| 変数 | 既定 | 意味 |
+|---|---|---|
+| `CLAUDE_CODEX_ROUTER_DIR` | `~/.claude/codex-router` | 置き場。変えたときは、`router.py`・`uninstall.sh`・移譲のスキルの `pick.sh` を動かすときにも同じ値を設定しておきます |
+| `CLAUDE_CODEX_ROUTER_SCHEDULER` | `auto` | インストーラが置くタイマー(`auto`・`systemd`・`launchd`・`cron`・`none`) |
+| `CLAUDE_CODEX_ROUTER_REF` | `main` | 方法 A で入れる版(ブランチ・タグ・コミット) |
+| `CLAUDE_CODEX_ROUTER_REPO` | このリポジトリ | 方法 A で取ってくるリポジトリ |
+| `CLAUDE_CONFIG_DIR` | `~/.claude` | Claude Code のログイン情報と会話ログの場所 |
+| `CODEX_HOME` | `~/.codex` | Codex のログイン情報と会話ログの場所 |
+| `TOKEN_PACE_DIR` | `~/.claude/token-pace` | [claude-token-pace](https://github.com/k-tashiro-arent/claude-token-pace) の記録の場所 |
+| `CLAUDE_CODEX_ROUTER_PICK_TIMEOUT` | 90 | 移譲のスキルの `pick.sh` が `now` の答えを待つ秒数 |
+| `CLAUDE_CODEX_ROUTER_SKILLS` | (聞く) | インストーラが入れる移譲のスキル(`claude`・`codex`・`both`・`none`) |
+| `CLAUDE_CODEX_ROUTER_SKILLS_REPLACE` | (聞く) | 同じ名前のスキルがすでにあるとき置き換えるか(`yes`・`no`) |
 
 ## 知っておくこと
 
-- Claude の使用量の API は**公開文書にありません**。Claude Code の版が上がると形が変わるおそれがあります。
-- `codex app-server` は Codex CLI で**試験中（experimental）**と表示される機能です。
-- LiteLLM の単価データは、コミュニティが保守している第三者のものです。新しいモデルが載るまでに遅れることがあり、提供元の資料と違うこともあります（違うときは `prices` で上書きしてください）。また、サブスクリプションの枠が API の単価と同じ比で数えているとは限りません。
-- Claude Code をしばらく起動しないとトークンの期限が切れ、その間は Claude の使用量を記録できません（Codex だけ記録されます）。
-- 超過分の利用（extra usage）が有効なアカウントで上限に達したとき、作業が止まるのか有料で続くのかによって、歯止めの意味が変わります。
-- 判断器に従って振り分けを変えたとき、どちらかが上限に達しないかは、過去の記録からは分かりません（記録は、そのとき実際に回した結果だからです）。使い始めは一部の仕事から回し、歯止めが働くかを見てください。
+- 使用率を読む API は、Claude・Codex とも**公開文書にありません**。サーバーの側で形が変わると、読めなくなるおそれがあります(読み取る URL は下の「記録とデータの扱い」)。
+- LiteLLM の単価データは、コミュニティが保守している第三者のものです。新しいモデルが載るまでに遅れることがあり、提供元の資料と違うこともあります(違うときは `prices` で上書きしてください)。また、プランの使用枠が API の単価と同じ比で使用量を数えているとは限りません。
+- Claude Code・Codex をしばらく使わないとログインのトークンの期限が切れ、その間はその側の使用率を読めません(その間は、読めた方を選びます)。
+- 上限を超えた分を有料で使える設定(extra usage)にしているアカウントで上限に達したとき、作業が止まるのか有料で続くのかによって、歯止めの意味が変わります。
+- このツールに従って振り分けを変えたとき、どちらかが上限に達しないかは、過去の記録からは分かりません(記録は、そのとき実際に回した結果だからです)。使い始めは一部の仕事から回し、歯止めが働くかを見てください。
 
 ### macOS について
 
@@ -184,16 +211,88 @@ python3 ~/.claude/codex-router/bin/router.py import   # 会話ログの料金・
 - タイマーは launchd に置きます。
 - どちらも試験的な対応です。うまく動かないときは issue で知らせてください。
 
-## アンインストール
-```bash
-bash ~/.claude/codex-router/uninstall.sh
-```
-タイマーと `router.py` を外します。記録と設定は残します（完全に消すには `rm -rf ~/.claude/codex-router`）。
+## 詳しい仕組み
+
+ここから先は、判断の中身を知りたい人向けです。使うだけなら読まなくて構いません。
+
+### 使用枠
+
+使用枠(冒頭のとおり、期間ごとの使える量の上限)の使った量は、上限に対して何%使ったか(使用率)で示されます。使い切らずに期間が終わると、残りはそのまま消えます。反対に、使い切ると、期間が終わるまで使えなくなります(上限を超えた分を有料で使える設定(extra usage)にしている場合を除きます)。
+
+使用枠は、そのプランのほかの使い方とも共有されます。
+- Claude のプラン：claude.ai・デスクトップ版・Claude Code・IDE での利用。
+- ChatGPT のプラン：Codex のどの使い方(CLI・IDE 拡張・クラウド・アプリ)も、ChatGPT Work など一部の機能も、同じ使用枠を使います。
+
+使用率は、Claude と ChatGPT のサービスから、プラン全体の値を読みます(読むのに Claude Code と Codex のログイン情報を使うので、その 2 つにログインしたコンピューターで動かします)。そのため、ほかの所で使った分も使用率には入ります。一方、料金(会話ログのトークン数に API の単価を掛けた額。実際の請求額ではありません)は、このツールを入れたコンピューターに残る会話ログの分だけを数えます(下の「記録とデータの扱い」)。
+
+サービスが返す使用枠を扱います。使用枠の数・長さ・上限が変わっても、そのまま扱えます。
+
+- Claude：使用率の API が返す使用枠の一覧(5 時間の `session`、7 日の `weekly_all` など)。知らない種類の使用枠は判断に使わず、注記に出します。
+  モデルを限った使用枠(例：Fable だけを数える 7 日の使用枠)は表示だけで、判断には使いません(その使用枠で作業が止まるかは、そのモデルを使っているかで決まり、このツールには分からないため)。
+- Codex：ChatGPT のサーバーが返す 2 つの使用枠(`primary`・`secondary`。長さもサーバーが返します)。
+
+### 使い切る確率
+
+このツールは、使った量を**料金(USD)**に換算して数えます：会話ログのトークン数 × モデル別の単価。
+
+- **単価**：動作時に [LiteLLM の単価データ](https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json)から取り、手元に控えます(1 日 1 回取り直し、取れないときは控えを使います)。設定の `prices` でモデルごとに上書きできます。単価の無いモデルは 0 として数え、注記に出します。
+- **上限の金額**(使用枠ごとに、動作時に推定します)：
+  - 使用率 u(%)が 10 以上なら、今の使用枠の分：使用枠の始まり(リセット − 使用枠の長さ)から今までの料金 × 100 ÷ u(料金の記録が使用枠の始まりより後からしか無いとき、または今の使用枠の料金が 0 のときは、すぐ下の「記録の分」を先に使います。それも無く料金があれば、記録の前の料金を 0 とみなしてこの式で出します)。
+  - それ未満なら、記録の分：今から 1 時間ずつさかのぼり、使用率の伸びがその使用枠 1 つ分(100%)になるまでの料金 × 100 ÷ 使用率の伸び(%)。上限に達していた時間と、28 日より前は数えません。伸びが 20% に届かなければ使わず、今の使用枠の分を使います(u が 10 未満でも)。
+  - 上限が変われば、その使用枠 1 つ分を使ううちに新しい値に移ります。
+- **これから使う料金の分布**：過去の料金(15 分ごと)から、今からリセットまでに使う料金 S の分布を作ります。
+  - 24 時間先まで：似た時点のその後・同じ時刻の実績・「使うか」×「いくら使うか」のシミュレーション・同じ時刻の実績を直前 7 日/3 日の水準で割り戻したもの・日の合計の見込みを時刻で割り振ったもの、を混ぜます。混ぜる割合は、このコンピューターの Claude の料金の記録から 1 日 1 回学び直し、Codex にも同じ割合を使います(学べるまでは同梱の割合)。
+  - それより先：似た時点のその後・直前 7 日の水準で割り戻したもの・日の合計の見込み、を等しい割合で混ぜます。記録が短くて前の 2 つを作れないあいだは、「使うか」×「いくら使うか」のシミュレーションも混ぜます。
+  - 「似た時点のその後」は、新しく、直前の使い方が似ている時点ほど重く見ます。1 日以上先は、毎日同じ時刻の時点を、直前 24 時間・7 日の料金と、期間に入る休日の割合で比べます。
+  - 休日(土日と設定の `holidays`)は平日と分けて扱います。
+- **使い切る確率 X**(次のリセットまでに上限に達する確率)＝ P(S ≥ 上限 × (1 − u/100))。**使い残す確率**＝ 1 − X。
+- 記録が短くても、ある分で X を出します。出さないのは、料金の記録が 1 つも無い方(Claude か Codex)の使用枠と、上限の金額を出せない使用枠だけです(使用率か今の使用枠の料金が 0 で、過去の記録からも出せないとき。注記に `limit unknown` と出ます)。判断ではその使用枠を見ません。料金の記録が予測する長さより短いあいだは、その長さの実績が要る見込みを外して混ぜます。
+  手元の記録(1 人分)で試した範囲では、料金の記録が 2 週間に満たないあいだは、記録が長いときより見込みが外れやすく、確率が 0 や 1 に寄りがちです。
+
+### 判断のしかた
+
+Claude と Codex の使用率をどちらも読めたときは、次の順に決めます。先の段で決まれば、後の段は見ません。一方しか読めないときは、満杯も歯止めも見ずに読めた方を、どちらも読めないときは `tie_default` を選びます(そのとき JSON の `full` は空、`claude_L`・`codex_L` は `null` です)。
+
+1. **満杯**：Claude と Codex の一方だけに、使用率が `full`(既定 98%)以上の使用枠があれば、もう一方に回します。どちらにもあるときは次の段へ進みます。
+2. **歯止め**：移譲元のどれかの使用枠で使い切る確率 X が `guard_risk`(既定 0.5)を超えるなら、移譲先に回します。
+   移譲元が上限に達すると、そこから任せている作業も止まるためです(移譲先が上限に達しても、移譲元に戻せば作業は続きます)。
+   そうでなく、移譲先の短い使用枠(1 日未満)の X が `guard_risk` を超えるなら、移譲元に回します(移譲元の歯止めと、この移譲先の条件に同時に当たるときは、移譲元の歯止めが先です)。
+3. **使い残す確率の比較**：長い使用枠(1 日以上)の使い残す確率を、Claude・Codex それぞれで最も小さいもの同士で比べ、大きい方に回します。短い使用枠はこの比較に入れません。
+   - 読み方：使い残す確率が 0.9 なら、これまでと同じように使うと 9 割の見込みで使い残すので、その使用枠を先に使うほど、期間の終わりに使われないまま消える使用量が減ります。0.1 なら、9 割の見込みで使い切ります。
+   - ちょうど等しければ `tie_default`(既定 codex)。X の出せる長い使用枠が無い方は 0.5 とみなします。
+   - 確率は、乱数で作った多数の見込みから数えるので、±0.03 程度の揺れがあります(同じ入力なら同じ値です)。まとまった料金を使った直後は、上限までの残りの金額が減るので、短い使用枠の確率が大きく上がることがあります。
+
+### 定期の記録(periodic sampling)
+
+- systemd では、インストーラが **linger を有効にします**(`loginctl enable-linger`)。linger が無いと、ユーザーの systemd はログインしたときにしか立ち上がりません。WSL を再起動したあと、ログインせずに Claude Code などを動かしている間は、タイマーが動かないままになります。
+  - 有効にできなかったとき・ユーザーの systemd に繋がらなかったときも、インストールは最後まで行い、手で打つコマンドを表示します。
+- WSL(やマシン)が止まっている間は、何も記録されません。起動したあとは、タイマーがまた 5 分おきに動きます(止まっていた間の分は補いません)。
+- `now` は、呼ばれるたびに使用率と料金を記録に足します。そのため、タイマーが止まっていても判断は続けられます。料金の記録がまだ無いときは、最初の `now` が会話ログを全部読みます(上の「入れた直後」)。また、タイマーが止まっている間は、混ぜる割合の学び直し・単価の更新が遅れ、使用率の記録に穴が空きます。タイマーが 30 分を超えて止まっていると、`now` の `notes` に書きます。
+- 確かめるには：`systemctl --user list-timers | grep codex`(systemd)、または `ls -l ~/.claude/codex-router/data/last-sample` でファイルの更新時刻(最後に `sample` が動いた時刻)を見ます。
+
+### 記録とデータの扱い
+
+- 記録は `~/.claude/codex-router/data/` に溜まります。
+  - `usage.jsonl`：使用率(1 行＝1 つの使用枠を 1 回読んだ値)。このツールが読んだ値のほかに、Codex の会話ログに載っている使用率(Codex が応答ごとに書きます)と、[claude-token-pace](https://github.com/k-tashiro-arent/claude-token-pace)(Claude の使用率を記録する別のツール)の記録(`$TOKEN_PACE_DIR`、既定 `~/.claude/token-pace`。見つかったときだけ)も、会話ログを読むときに足します。このツールを入れる前の分も入ります。
+  - `cost-state.json`：会話ログをどこまで読んだか。消すと、次に会話ログを全部読み直します。
+  - `last-sample`：最後に `sample` が動いた時刻。
+  - `cost-claude.jsonl`・`cost-codex.jsonl`：会話ログから写したトークン数(料金は単価から都度計算します)。Claude Code の会話ログは既定で 30 日たつと消えるので、読んだ分をここに溜めます。
+  - `litellm-prices.json`：単価データの控え。`weights.json`：学んだ混ぜる割合。どの予測の方法で学んだかの印(`form`)を持ち、今の版と違えば使いません(同梱の既定を使い、`install.sh` か次の `sample` が学び直します)。
+- 料金は、このツールを入れたコンピューターの会話ログの分だけです。上限の金額を低く見積もる向きに効きます。
+  - 入るもの：そのコンピューターの Claude Code の会話(`$CLAUDE_CONFIG_DIR/projects`、既定 `~/.claude/projects`)と、Codex の会話(`$CODEX_HOME/sessions`、既定 `~/.codex/sessions`。CLI・`codex exec`・Codex の MCP サーバー・そのコンピューターで動かした IDE 拡張の分)。
+  - 入らないもの：ほかの端末、claude.ai・デスクトップ版、Codex のクラウドのタスク、ChatGPT Work など ChatGPT のほかの機能、Windows 側で動かした Codex のアプリ(Windows のホームの `.codex` に記録されます)。
+- 外へ出るのは次の読み取りだけです。使用率の読み取りはどちらもモデルを呼ばないので、使用枠は減りません。
+  - Claude：`GET https://api.anthropic.com/api/oauth/usage`(Claude Code の `/usage` と同じ)。トークンは `$CLAUDE_CONFIG_DIR`(既定 `~/.claude`)の `.credentials.json` を**読むだけで、更新しません**(更新すると Claude Code 本体の認証を壊しうるため)。
+  - Codex：`GET https://chatgpt.com/backend-api/wham/usage`。トークンは `$CODEX_HOME`(既定 `~/.codex`)の `auth.json` を**読むだけで、更新しません**。
+  - 単価：LiteLLM の単価データ(GitHub から 1 日 1 回)。
+- Claude の使用率の API は、短い間に続けて呼ぶと 429(呼び過ぎ)を返します。そのため次のようにします。どちらの場合も、そのことを `notes` に書きます。
+  - `claude_min_interval` 秒(既定 60 秒)以内に読んだ記録があれば、API を呼ばずにそれを使います。
+  - それでも 429 が返ったときは、呼び直さず、記録にある 10 分以内の最新の値を使います。10 分以内の記録が無ければ、Claude は読めなかった扱いです。
 
 ## 開発
 ```bash
 python3 -m unittest discover -s test   # 単体テスト
-bash test/smoke.sh                     # インストールからアンインストールまで（偽の HOME・codex・使用量 API・crontab・単価・会話ログ）
+bash test/smoke.sh                     # インストールからアンインストールまで
 ```
 
 ## ライセンス

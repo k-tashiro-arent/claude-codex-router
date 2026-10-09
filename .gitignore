@@ -6,8 +6,8 @@ __pycache__/
 .DS_Store
 *.swp
 
-# Serena (ローカルのプロジェクト解析メタ。配布物ではない)
+# Serena (local project analysis metadata; not part of the distribution)
 .serena/
 
-# テストが CLAUDE_CODEX_ROUTER_DIR の既定に使う（作られない想定）
+# used by the tests as the default CLAUDE_CODEX_ROUTER_DIR (not expected to be created)
 test/_no_install/
