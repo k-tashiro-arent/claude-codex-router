@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    name: shellcheck & bash -n
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        run: shellcheck install.sh uninstall.sh bootstrap.sh test/smoke.sh
+      - name: bash -n syntax check
+        run: |
+          for f in install.sh uninstall.sh bootstrap.sh test/smoke.sh; do
+            bash -n "$f"
+          done
+
+  # ruff はバージョンを固定する（未固定だと既定ルールの変更だけで CI が赤くなる）。検査対象は ruff.toml で固定
+  python-lint:
+    name: python lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: py_compile
+        run: python -m py_compile bin/*.py test/*.py
+      - name: ruff
+        run: |
+          python -m pip install --quiet 'ruff==0.16.4'
+          ruff check bin/ test/
+
+  # インストールからアンインストールまで（偽の HOME・codex・使用量 API・crontab）。
+  # ubuntu + macOS、install.sh を直接と、curl ワンライナーの経路（ローカルの checkout を clone）の両方
+  smoke:
+    name: smoke (${{ matrix.os }} / ${{ matrix.mode }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        mode: [direct, bootstrap]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: prepare local ref for bootstrap
+        if: matrix.mode == 'bootstrap'
+        run: git branch -f citest HEAD
+      - name: run smoke test
+        env:
+          SMOKE_INSTALL_MODE: ${{ matrix.mode }}
+          SMOKE_BOOTSTRAP_REF: citest
+        run: bash test/smoke.sh

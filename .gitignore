@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+
+# Editor / OS
+.DS_Store
+*.swp
+
+# Serena (ローカルのプロジェクト解析メタ。配布物ではない)
+.serena/
+
+# テストが CLAUDE_CODEX_ROUTER_DIR の既定に使う（作られない想定）
+test/_no_install/

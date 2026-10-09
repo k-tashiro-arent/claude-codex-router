@@ -1,0 +1,9 @@
+{
+  "main": "claude",
+  "guard_risk": 0.5,
+  "tie_default": "codex",
+  "full": 98,
+  "claude_min_interval": 60,
+  "holidays": [],
+  "prices": {}
+}
