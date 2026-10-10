@@ -29,9 +29,9 @@ Exhaust probability X (probability of reaching the limit before the window's nex
 
 Decision (once a stage decides, later stages are not looked at):
   1. Full: if only one side has reached the limit (full in config, default 98%) in some window, the other side. If both have, go on.
-  2. Guard: if X of any main-side window exceeds guard_risk in config (default 0.5), the sub side.
+  2. Guard: if X of any main-side window exceeds guard_risk in config (default 0.5) and no sub-side window does, the sub side.
      When the main side reaches its limit, the side that drives the work with it stops too. If the sub side is at its limit, work continues by returning to the main side.
-     If X of a short window (under 1 day) of the sub side exceeds guard_risk, the main side.
+     If X of any sub-side window exceeds guard_risk and no main-side window does, the main side. If both sides have such a window, go on.
   3. Compare: for long windows (1 day or more), the probability of not using the window up before the reset, 1 − X (leftover probability); the side whose minimum is larger.
      If equal, tie_default in config (default codex).
 
@@ -70,7 +70,7 @@ usage:
 
 now --json fields: pick, main, reason (full|guard|tie|leftover|codex_unreadable|claude_unreadable|both_unreadable), tie,
   guard (main-side windows over guard_risk, when they sent the pick to the sub side),
-  sub_tight (sub-side short windows over guard_risk, when they kept the pick on main), full (all windows at full),
+  sub_tight (sub-side windows over guard_risk, when they kept the pick on main), full (all windows at full),
   claude_L, codex_L, windows, errors, notes. Data and settings: $CLAUDE_CODEX_ROUTER_DIR (default ~/.claude/codex-router)."""
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1209,7 +1209,7 @@ def decide_states(states, main=MAIN, guard=GUARD_RISK, default=TIE_DEFAULT):
         return min(v) if v else 0.5
     full = {s: [k for k, v in use[s].items() if v['u'] >= FULL] for s in use}
     over = [k for k, v in use[main].items() if v['X'] is not None and v['X'] > guard]
-    tight = [k for k, v in use[sub].items() if v['win'] < LONG_WIN and v['X'] is not None and v['X'] > guard]
+    tight = [k for k, v in use[sub].items() if v['X'] is not None and v['X'] > guard]
     L = {s: leftover(use[s]) for s in use}
     # guard and sub_tight list windows only when the decision was made at that stage. full always lists every full window
     why = {'main': main, 'claude_L': L['claude'], 'codex_L': L['codex'], 'guard': [], 'sub_tight': [],
@@ -1218,9 +1218,10 @@ def decide_states(states, main=MAIN, guard=GUARD_RISK, default=TIE_DEFAULT):
         return main, dict(why, stage='full')
     if full[main] and not full[sub]:
         return sub, dict(why, stage='full')
-    if over:
+    # when both sides have a window over guard, the guard does not decide (sending to either side may use it up); go on to the comparison
+    if over and not tight:
         return sub, dict(why, stage='guard', guard=over)
-    if tight:
+    if tight and not over:
         return main, dict(why, stage='guard', sub_tight=tight)
     if L['claude'] == L['codex']:
         return default, dict(why, stage='tie', tie=True)

@@ -358,9 +358,24 @@ class DecideTests(unittest.TestCase):
 
     def test_guard_on_main_goes_to_sub(self):
         s = {'claude': {'claude-session': self.st(80, 0.7, 300), 'claude-weekly_all': self.st(10, 0.0)},
-             'codex': {'codex-7d': self.st(90, 0.95)}}
+             'codex': {'codex-7d': self.st(50, 0.3)}}
         self.assertEqual(route.decide_states(s, 'claude')[0], 'codex')
+        s = {'claude': {'claude-weekly_all': self.st(10, 0.0)}, 'codex': {'codex-7d': self.st(90, 0.95)}}
         self.assertEqual(route.decide_states(s, 'codex')[0], 'claude')      # if the main side is Codex, Codex's guard sends it to Claude
+
+    def test_guard_on_both_sides_goes_to_the_comparison(self):
+        # the main side's weekly window is over guard, but the sub side's is nearer its limit: sending to the sub side would use it up first
+        s = {'claude': {'claude-weekly_all': self.st(61, 0.595)}, 'codex': {'codex-7d': self.st(83, 0.618)}}
+        pick, why = route.decide_states(s, 'claude')
+        self.assertEqual((pick, why['stage'], why['guard'], why['sub_tight']), ('claude', 'leftover', [], []))
+        s = {'claude': {'claude-session': self.st(80, 0.7, 300), 'claude-weekly_all': self.st(10, 0.0)},
+             'codex': {'codex-7d': self.st(90, 0.95)}}
+        self.assertEqual(route.decide_states(s, 'claude')[0], 'claude')
+
+    def test_sub_long_window_tight_keeps_main(self):
+        s = {'claude': {'claude-weekly_all': self.st(10, 0.2)}, 'codex': {'codex-7d': self.st(80, 0.7)}}
+        pick, why = route.decide_states(s, 'claude')
+        self.assertEqual((pick, why['stage'], why['sub_tight']), ('claude', 'guard', ['codex-7d']))
 
     def test_sub_short_window_tight_keeps_main(self):
         s = {'claude': {'claude-weekly_all': self.st(10, 0.0)},
@@ -394,7 +409,7 @@ class DecideTests(unittest.TestCase):
         both_tight = {'claude': {'claude-weekly_all': self.st(40, 0.7)},
                       'codex': {'codex-5h': self.st(70, 0.8, 300), 'codex-7d': self.st(5, 0.0)}}
         pick, why = route.decide_states(both_tight, 'claude')
-        self.assertEqual((pick, why['stage'], why['guard'], why['sub_tight']), ('codex', 'guard', ['claude-weekly_all'], []))
+        self.assertEqual((pick, why['stage'], why['guard'], why['sub_tight']), ('codex', 'leftover', [], []))
 
     def test_tie_follows_default(self):
         s = {'claude': {'claude-weekly_all': self.st(10, 0.2)}, 'codex': {'codex-7d': self.st(10, 0.2)}}

@@ -33,7 +33,7 @@ fake 'import json, sys; print(json.dumps({"pick": "codex", "reason": "guard", "c
 check "router picks codex (guard)" codex "guard (main side): claude-7d"
 
 fake 'import json, sys; print(json.dumps({"pick": "claude", "main": "claude", "reason": "guard", "claude_L": 0.4, "codex_L": 0.5, "guard": [], "sub_tight": ["codex-5h"], "full": [], "errors": []}))'
-check "kept on the main side by a sub-side short window" claude "kept on main (sub side short window): codex-5h"
+check "kept on the main side by a sub-side window" claude "kept on main (sub side): codex-5h"
 
 fake 'import json, sys; print(json.dumps({"pick": "codex", "reason": "full", "claude_L": 0.0, "codex_L": 0.5, "guard": [], "sub_tight": [], "full": ["claude-session"], "errors": []}))'
 check "full window" codex "full: claude-session"
