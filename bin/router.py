@@ -7,8 +7,8 @@ Windows: every window the API returns is handled (their number, length and limit
   Claude: each window in limits of the usage API (every kind). The API gives no length: it is estimated from the reads (estimate_length: the largest,
           over the periods, of the reset minus the period's first read); until some period's start has been read closely, only a lower bound.
           Model-scoped windows (windows with a scope) are shown only, not used for the decision.
-  Codex : every window in the response (the API returns the length); those under rate_limit are used, the others (what they apply to is not known)
-          are shown only.
+  Codex : every window in the response, under any key (the API returns the length); all are used. Kinds are named by the exact length
+          (in days, hours or minutes, whichever divides it: 7d, 5h, 90m).
 
 Usage is counted in cost (USD): token counts in the conversation logs × per-model price.
   Prices are taken at run time from LiteLLM's price data and cached in <DIR>/data/litellm-prices.json (sample refetches it when older than 1 day;
@@ -43,12 +43,12 @@ Decision (once a stage decides, later stages are not looked at):
      returning to the main side (the delegation skills do so), so the sub side has no guard.
      Only one side read: that side, except that the sub side is chosen when the main side is read and over guard (the sub side's state is not needed).
   3. Compare: the side whose contract is expected to leave more cost ($) unused although it could be used. For a side, T = the next reset of its longest
-     window (where unused cost is lost; a shorter window's leftover is still held by the longest one); what it can use until T = the least, over its
-     windows, of the remaining amount plus the whole limit for each further period of the window starting before T (a window resetting after T adds
-     nothing; a shorter window whose periods until T allow more than the longest one holds does not bind); expected leftover = E[max(0, that − S)],
-     S the forecast use until T.
+     window (where unused cost is lost; a shorter window's leftover is still held by the longest one; with estimated lengths, every window that may be
+     the longest counts and the earliest reset is taken). Along forecast paths of the use until T, the use actually possible is cut by every window's
+     remaining amount in each of its periods (a period starting before T makes its whole limit usable); the cost that could still be used on top,
+     as far as every window's period allows, is the leftover (contract_leftover); its mean over the paths is compared.
      If a side has a window without a limit in cost (X from usage growth), the cost cannot be compared: the leftover probability 1 − X of each side's
-     longest window is compared instead (a side without any X counts as 0.5), reason leftover_prob. If equal, tie_default in config (default codex).
+     longest window is compared instead, reason leftover_prob. If equal, or a side has no X at all, tie_default in config (default codex).
 
 Usage records (each environment accumulates its own):
   <DIR>/data/usage.jsonl. 1 line = 1 read of 1 window {"ts", "side", "id": window kind, "win": window length (min), "u": usage, "r": reset time,
@@ -130,7 +130,7 @@ except (TypeError, ValueError):
 RECENT_MAX_AGE = 600   # max age (s) of the record used instead on 429. Records are every 5 minutes, so this is 2 records' worth
 TIE_DEFAULT = CONFIG['tie_default'] if CONFIG['tie_default'] in ('claude', 'codex') else 'codex'
 LIMIT_NOW_U = 10.0   # if usage is at least this, the limit is estimated from the current window
-LEN_TIGHT = 0.02   # a window's length counts as known when some period's start is bracketed by two reads closer than this share of the length
+LEN_RECENT = 5     # the length is the median over this many latest periods whose start was bracketed closely (so that it follows a change)
 
 
 # ---- prices (LiteLLM) ----
@@ -297,18 +297,31 @@ def _codex_rows(path, start, st, usage=None):
     return out, start + end
 
 
+def _windows_in(v, has, path=()):
+    """Every object under v (dicts and lists, any depth) that has all the keys of has, with its path of keys (any number of windows)."""
+    if isinstance(v, dict):
+        if all(v.get(k) is not None for k in has):
+            yield path, v
+            return
+        for k, x in v.items():
+            yield from _windows_in(x, has, path + (str(k),))
+    elif isinstance(v, list):
+        for i, x in enumerate(v):
+            yield from _windows_in(x, has, path + (str(i),))
+
+
 def _codex_usage_rows(rl, stamp, out):
-    """rate_limits {primary, secondary} in a Codex conversation log → usage record rows."""
+    """rate_limits in a Codex conversation log → usage record rows: every window in it (any number, any key)."""
     try:
         ts = int(_ts(stamp))
     except ValueError:
         return
-    for k in ('primary', 'secondary'):
-        w = rl.get(k)
+    found = list(_windows_in(rl, ('window_minutes', 'used_percent', 'resets_at')))
+    lens = [w.get('window_minutes') for _, w in found]
+    for path, w in found:
         try:
-            if w and w.get('window_minutes') and w.get('resets_at'):
-                out.append({'ts': ts, 'side': 'codex', 'win': int(w['window_minutes']), 'u': float(w['used_percent']),
-                            'r': int(w['resets_at']), 'src': 'codex-sessions'})
+            out.append({'ts': ts, 'side': 'codex', 'win': int(w['window_minutes']), 'u': float(w['used_percent']), 'r': int(w['resets_at']),
+                        'src': 'codex-sessions', **({'place': '.'.join(path)} if lens.count(w['window_minutes']) > 1 else {})})
         except (TypeError, ValueError, KeyError):
             continue
 
@@ -329,8 +342,8 @@ def _token_pace_rows(path, start, name):
             continue
         if name == 'pace.jsonl':   # Claude: every field k with a reset field k + 'r'; which window it is, is found from the reset times (load_series)
             vals = [('claude', k, None, d.get(k), d.get(k + 'r')) for k in d if k != 'ts' and k + 'r' in d]
-        else:                      # Codex: the length Codex reported
-            vals = [('codex', None, d.get('w'), d.get('u'), d.get('r')), ('codex', None, d.get('w2'), d.get('u2'), d.get('r2'))]
+        else:                      # Codex: every group of fields w<suffix> (length Codex reported), u<suffix>, r<suffix>
+            vals = [('codex', None, d.get(k), d.get('u' + k[1:]), d.get('r' + k[1:])) for k in d if k.startswith('w') and 'u' + k[1:] in d and 'r' + k[1:] in d]
         for side, key, win, u, r in vals:
             try:
                 if (key or win) and r and u is not None:
@@ -642,6 +655,33 @@ class Analog:
                 hi = mid
         return ess_of(hi)[1]
 
+    def predict_paths(self, offsets, n=N_SAMP, seed=0):
+        """n paths of the cumulated use at each of offsets (seconds, ascending): each from one start s drawn with the weights for the horizon x = the last
+        offset (cum(s + o) − cum(s)); x longer than half of the records: ⌈x/xb⌉ segments of x/⌈x/xb⌉ from starts drawn independently, one after another."""
+        if not self.grid:
+            return None
+        x = offsets[-1]
+        xb = min(x, (self.t - self.first) / 2)
+        m = bisect.bisect_right(self.grid, self.t - xb)
+        w = self._weights(m) if m and xb > 0 else []
+        if not w or sum(w) <= 0:
+            return None
+        rng = random.Random(seed)
+        k = int(math.ceil(x / xb - 1e-9))
+        seg = x / k
+        idx = rng.choices(range(m), weights=w, k=n * k)
+        out = []
+        for i in range(n):
+            starts = [self.grid[j] for j in idx[i * k:(i + 1) * k]]
+            full = [self.cum.at(s + seg) - self.cum.at(s) for s in starts]
+            path = []
+            for o in offsets:
+                j = min(int(o // seg), k - 1)
+                s = starts[j]
+                path.append(sum(full[:j]) + self.cum.at(s + (o - j * seg)) - self.cum.at(s))
+            out.append(path)
+        return out
+
     def predict(self, xs, n=N_SAMP, seed=0):
         """Samples of the use in [t, t + x) for each x of xs (seconds). None if there are no records."""
         rng = random.Random(seed)
@@ -661,6 +701,19 @@ class Analog:
             draws = rng.choices(ys, weights=w, k=n * k)
             out.append([sum(draws[i * k:(i + 1) * k]) * x / (k * xb) for i in range(n)])
         return out
+
+
+def forecast_paths(ev, t, offsets, n=N_SAMP, seed=0):
+    """Paths of the cumulated use from t at each of offsets (seconds, ascending; the last is the horizon), the same mixture as forecast for the horizon:
+    each path follows one past start (or, beyond half of the records, a few starts one after another), so the uses at the offsets belong together."""
+    if not ev or not offsets:
+        return None
+    a = Analog().fit(ev, t).predict_paths(offsets, n, seed)
+    b = Analog(plain=True).fit(ev, t).predict_paths(offsets, n, seed + 1)
+    if not a or not b:
+        return a or b
+    k = int(round(n * FC_MIX / (FC_MIX + (t - ev[0][0]) / offsets[-1])))
+    return a[:n - k] + b[:k]
 
 
 def forecast(ev, t, xs, n=N_SAMP, seed=0):
@@ -717,32 +770,70 @@ def clean_points(pts):
 
 
 def row_id(x):
-    """Window kind of a record row: the id the API gave. Rows without one: Codex by the length the API gave; Claude rows imported from claude-token-pace
-    or written by earlier versions get a provisional kind ('legacy:...'), which load_series joins to the API's kind with the same reset times."""
-    if x.get('id'):
+    """Window kind of a record row. Claude: the id the API gave; rows without one (imported from claude-token-pace or written by earlier versions) get a
+    provisional kind ('legacy:...'), which load_series joins to the API's kind with the same reset times. Codex: the exact length the API gave
+    (rows of earlier versions too, whatever their id)."""
+    if x.get('id') and x.get('side') != 'codex':
         return x['id']
     if x.get('side') == 'claude':
         return f'legacy:{x["tp"]}' if x.get('tp') else f'legacy:{x.get("win")}'
-    return win_label(x.get('win'))
+    try:   # Codex: by the exact length the API gave (the place in the response too, when two windows are as long)
+        return exact_label(int(x['win'])) + (f'@{x["place"]}' if x.get('place') else '')
+    except (KeyError, TypeError, ValueError):
+        return x.get('id') or '?'
 
 
-def _join_legacy(reads):
-    """{kind: [(ts, r, ...)]} → the same with each provisional kind ('legacy:...') joined to the API's kind whose reset times match most of its reads
-    (within 1 hour). A provisional kind matching none stays as it is."""
-    resets = {k: sorted(v[1] for v in rs if v[1]) for k, rs in reads.items() if not k.startswith('legacy:')}
+def exact_label(win_min):
+    """An exact length (whole minutes) as days, hours or minutes, in the largest unit that divides it (10080 → 7d, 300 → 5h, 90 → 90m)."""
+    if win_min % 1440 == 0:
+        return f'{win_min // 1440}d'
+    if win_min % 60 == 0:
+        return f'{win_min // 60}h'
+    return f'{win_min}m'
+
+
+def _join_legacy(reads, scoped=()):
+    """{kind: [(ts, r, ...)]} → the same with each provisional kind ('legacy:...') joined to the API's kind (not model-scoped: earlier versions and
+    claude-token-pace recorded only windows without a scope) whose reset times match most of its reads. A read matches a reset differing by less than
+    1/20 of the time from the read to its reset (a part of a lower bound of the length, so the match does not depend on the length).
+    A provisional kind matching none, or two kinds equally, stays as it is."""
+    resets = {k: sorted(v[1] for v in rs if v[1]) for k, rs in reads.items() if not k.startswith('legacy:') and k not in scoped}
     out = {k: list(v) for k, v in reads.items() if not k.startswith('legacy:')}
     for k, rs in reads.items():
         if not k.startswith('legacy:'):
             continue
         hits = {}
         for v in rs:
+            if not v[1] or v[0] >= v[1]:
+                continue
+            tol = (v[1] - v[0]) / 20
             for kk, rr in resets.items():
-                i = bisect.bisect_left(rr, (v[1] or 0) - 3600)
-                if v[1] and i < len(rr) and abs(rr[i] - v[1]) < 3600:
+                i = bisect.bisect_left(rr, v[1] - tol)
+                if i < len(rr) and abs(rr[i] - v[1]) < tol:
                     hits[kk] = hits.get(kk, 0) + 1
-        to = max(hits, key=hits.get) if hits else k
+        best = sorted(hits.values(), reverse=True)
+        to = max(hits, key=hits.get) if best and (len(best) == 1 or best[0] > best[1]) else k
         out.setdefault(to, []).extend(rs)
     return out
+
+
+def periods_of(reads):
+    """Periods [(first read, reset, read before the first read or None, largest usage)] from reads [(ts, r, u)] in time order. A read starts a new period
+    when the previous period's reset has passed (its reset can drift between reads of one period: the latest is kept); a read after its own reset
+    (an old session reporting a period already over) or without a reset (no period running) starts none; the read before is the latest one that showed
+    a running period or none (not an old value). No tolerance in time is used."""
+    out, cur, prev = [], None, None
+    for ts, r, u in sorted(reads, key=lambda v: v[0]):
+        if r and ts < r:
+            if cur is None or ts >= cur[1]:
+                cur = [ts, r, prev, u or 0.0]
+                out.append(cur)
+            else:
+                cur[1] = max(cur[1], r)
+                cur[3] = max(cur[3], u or 0.0)
+        if not (r and ts >= r):   # a read of a period already over (an old value) says nothing about whether a new period has started
+            prev = ts
+    return [tuple(c) for c in out]
 
 
 def win_label(win_min):
@@ -757,17 +848,21 @@ def win_label(win_min):
 class Series:
     """Holds the observations [(ts, u, r)] of one window, split into periods (one per reset)."""
 
-    def __init__(self, side, wid, win_min, samples, scoped=False, known=True):
+    def __init__(self, side, wid, win_min, samples, scoped=False, known=True, lo=None, hi=None, contiguous=None):
         self.side, self.id, self.win_min, self.win, self.scoped, self.known = side, wid, win_min, win_min * 60, scoped, known
+        self.lo, self.hi = (win_min, win_min) if lo is None else (lo, hi)    # the length is in [lo, hi] (min; hi inf: only a lower bound)
+        self.contiguous = contiguous    # whether each period starts at the previous reset (True), later (False), or not known (None)
         self.name = f'{side}-{wid}'
-        # drop values (t >= r) from old sessions that keep reporting a period already reset. Periods are split by reset time (differences within 1 hour count as the same)
-        s = sorted((r, t, u) for t, u, r in samples if r and t < r)
+        # drop values (t >= r) from old sessions that keep reporting a period already reset. A new period starts at the first read after the previous
+        # period's reset (periods_of); the reset may drift between the reads of one period (the latest is kept)
+        s = sorted((t, u, r) for t, u, r in samples if r and t < r)
         clusters = []
-        for r, t, u in s:
-            if clusters and r - clusters[-1]['r0'] < 3600:
+        for t, u, r in s:
+            if clusters and t < clusters[-1]['r']:
                 clusters[-1]['pts'].append((t, u))
+                clusters[-1]['r'] = max(clusters[-1]['r'], r)
                 continue
-            clusters.append({'r0': r, 'r': r, 'pts': [(t, u)]})
+            clusters.append({'r': r, 'pts': [(t, u)]})
         groups = []
         for c in clusters:
             segs = clean_points(sorted(c['pts']))
@@ -805,23 +900,43 @@ class Series:
 
 
 def estimate_length(reads):
-    """Length (min) of a window from its reads [(ts, r)] (r None when no period was running): a period started at or before its first read, so
-    r − (first read of the period) is at most the length; the largest over the periods. Returns (length, known): known when some period's start is
-    bracketed by that read and the read before it (closer than LEN_TIGHT of the length). Not known: only a lower bound. (None, False) without periods.
-    The length is not taken from the window's kind (the usage API does not give it, and it may change)."""
-    lows, tight, cur, prev = [], [], None, None
-    for ts, r in sorted(reads):
-        if r and ts < r and not (cur and abs(r - cur) < 3600):
-            lo = (r - ts) / 60
-            lows.append(lo)
-            if prev is not None and (ts - prev) / 60 <= LEN_TIGHT * lo:
-                tight.append(lo)
-            cur = r
-        prev = ts
-    if not lows:
-        return None, False
-    est = max(lows)
-    return est, any(lo >= est * (1 - LEN_TIGHT) for lo in tight)
+    """Length of a window (min) from its reads [(ts, r, u)] (r None when no period was running), not from its kind (the usage API gives none, and it may
+    change). Periods whose usage stayed 0 are not used as evidence (claude-token-pace recorded a placeholder reset while nothing was used); with nothing
+    else, they give a lower bound only.
+    Each period started at or before its first read t1 and after the read before it t0, so its length is in [r − t1, r − t0]. A period is bracketed
+    closely when t1 − t0 is at most twice the usual bracket of the window (the median of t1 − t0 over its periods) and under half of r − t1.
+    Returns {'len', 'lo', 'hi', 'known', 'contiguous'} or None without periods:
+      known: the median, over the latest LEN_RECENT closely bracketed periods, of the middle of their brackets (so that it follows a change of the length,
+             and a period that ended early does not move it); lo/hi: the bracket of that period. If a later period's r − t1 exceeds hi (the length grew),
+             not known any more.
+      not known: the largest r − t1 (a lower bound only; hi inf).
+      contiguous: whether closely bracketed periods start at the previous period's reset (each bracket contains it) or after it (a gap); None if no evidence."""
+    every = periods_of(reads)
+    if not every:
+        return None
+    ps = [p[:3] for p in every if p[3] > 0]
+    if not ps:   # nothing used yet: a lower bound only
+        low = max((r - t1) / 60 for t1, r, _, _ in every)
+        return {'len': low, 'lo': low, 'hi': math.inf, 'known': False, 'contiguous': None}
+    widths = sorted(t1 - t0 for t1, _, t0 in ps if t0 is not None)
+    usual = widths[len(widths) // 2] if widths else None
+    tight = [(k, t1, r, t0) for k, (t1, r, t0) in enumerate(ps) if t0 is not None and t1 - t0 <= 2 * usual and t1 - t0 < (r - t1) / 2]
+    lows = [(r - t1) / 60 for t1, r, _ in ps]
+    cont = []
+    for k, t1, r, t0 in tight:
+        if k > 0:
+            prev_r = ps[k - 1][1]
+            cont.append(t0 <= prev_r <= t1)
+    contiguous = (sum(cont) > len(cont) / 2) if cont else None
+    if not tight:
+        return {'len': max(lows), 'lo': max(lows), 'hi': math.inf, 'known': False, 'contiguous': contiguous}
+    last = sorted(tight[-LEN_RECENT:], key=lambda v: v[2] - (v[1] + v[3]) / 2)
+    _, t1, r, t0 = last[len(last) // 2]
+    est, lo, hi = (r - (t1 + t0) / 2) / 60, (r - t1) / 60, (r - t0) / 60
+    later = max(lows[tight[-1][0] + 1:], default=0.0)
+    if later > hi:                        # a later period is longer than the bracket allows: the length grew
+        return {'len': later, 'lo': later, 'hi': math.inf, 'known': False, 'contiguous': contiguous}
+    return {'len': est, 'lo': lo, 'hi': hi, 'known': True, 'contiguous': contiguous}
 
 
 def load_series(side, rows=None, until=None):
@@ -831,22 +946,24 @@ def load_series(side, rows=None, until=None):
         if x.get('side') != side or (until is not None and x['ts'] > until):
             continue
         k = row_id(x)
-        reads.setdefault(k, []).append((x['ts'], x.get('r')))
+        reads.setdefault(k, []).append((x['ts'], x.get('r'), float(x['u']) if x.get('u') is not None else None))
         if side == 'codex' and x.get('win'):
             meta[k] = int(x['win'])
         if x.get('r'):
             by.setdefault(k, []).append((x['ts'], float(x['u']), x['r'], bool(x.get('scoped'))))
     if side == 'claude':
-        joined = _join_legacy({k: [(ts, r, i) for i, (ts, r) in enumerate(v)] for k, v in reads.items()})
-        reads = {k: [(ts, r) for ts, r, _ in v] for k, v in joined.items()}
-        by = _join_legacy({k: [(v[0], v[2], v) for v in smp] for k, smp in by.items()})
+        scoped = {k for k, smp in by.items() if any(v[3] for v in smp)}
+        reads = _join_legacy(reads, scoped)
+        by = _join_legacy({k: [(v[0], v[2], v) for v in smp] for k, smp in by.items()}, scoped)
         by = {k: [v[2] for v in smp] for k, smp in by.items()}
     out = {}
     for k, smp in by.items():
         smp.sort()
-        win, known = (meta[k], True) if k in meta else estimate_length(reads[k])
-        if win:
-            out[k] = Series(side, k, win, [v[:3] for v in smp], smp[-1][3], known)
+        e = estimate_length(reads[k])
+        if k in meta:   # the length the API gave; periods for the contiguity only
+            out[k] = Series(side, k, meta[k], [v[:3] for v in smp], smp[-1][3], True, contiguous=e and e['contiguous'])
+        elif e:
+            out[k] = Series(side, k, e['len'], [v[:3] for v in smp], smp[-1][3], e['known'], e['lo'], e['hi'], e['contiguous'])
     return out
 
 
@@ -860,7 +977,7 @@ def record(rows, src='live'):
     with open(USAGE_LOG, 'a') as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         for x in rows:
-            f.write(json.dumps({'ts': int(x.get('ts') or time.time()), 'side': x['side'], **{k: x[k] for k in ('id', 'tp', 'win') if x.get(k)},
+            f.write(json.dumps({'ts': int(x.get('ts') or time.time()), 'side': x['side'], **{k: x[k] for k in ('id', 'tp', 'win', 'place') if x.get(k)},
                                 'u': x['u'], 'r': x['r'], **({'scoped': True} if x.get('scoped') else {}), 'src': x.get('src', src)}) + '\n')
 
 
@@ -887,10 +1004,10 @@ def usage_events(ser, t):
 
 def limit_hist(ser, cs_, t):
     """Limit ($) from history: going back from t 1 hour at a time, cost until the usage growth reaches 100% ÷ growth. None if the growth is under 20%.
-    It goes back to the nearest of 28 days, the start of the cost records and the start of the usage records."""
+    It goes back at most to the start of the cost records or of the usage records (no fixed span: a long window needs a long history)."""
     c = du = 0.0
     b = t
-    lo = max(cs_.T0, t - 28 * 86400, ser.first)    # time before the usage records start is not counted (only the cost would grow, with no growth in usage)
+    lo = max(cs_.T0, ser.first)    # time before the usage records start is not counted (only the cost would grow, with no growth in usage)
     while b - 3600 >= lo:
         a = b - 3600
         if max(ser.u_at(a), ser.u_at(b)) < FULL:
@@ -919,24 +1036,65 @@ def limit_usd(ser, cs_, u, t, r, win_min, known=True):
 
 
 def leftover_horizon(wins):
-    """The time T at which the contract's unused cost is lost: the next reset of its longest window (the earliest of them if several are as long).
-    A shorter window's leftover at its reset is not lost: the longest window still holds it (using every shorter period fully would exceed the longer one).
-    wins: [(remaining $, limit $, reset, length min)]."""
-    longest = max(win for _, _, _, win in wins)
-    return min(r for _, _, r, win in wins if win == longest)
+    """The time T at which the contract's unused cost is lost: the next reset of its longest window. A shorter window's leftover at its reset is not lost:
+    the longest window still holds it (using every shorter period fully would exceed the longer one). Lengths are known within [lo, hi] (an estimate);
+    every window that may be the longest (hi ≥ the largest lo) counts as the longest, and the earliest of their resets is taken.
+    wins: [{'r': reset, 'lo': min, 'hi': min (inf: a lower bound only), ...}]."""
+    top = max(w['lo'] for w in wins)
+    return min(w['r'] for w in wins if w['hi'] >= top)
 
 
-def contract_leftover(wins, samples, t):
-    """Expected cost ($) the side's contract leaves unused although it could be used: T = leftover_horizon(wins); what can be used until T is the least,
-    over the windows, of the remaining amount plus the whole limit for each further period of the window that starts before T (a started period makes
-    its whole limit usable; a window resetting after T adds nothing); the expected leftover is E[max(0, that − S)], S the use from t until T (samples).
-    A shorter window does not bind when its periods until T allow more than the longest window holds; one that allows less does (then the part of the
-    longest window's amount beyond it cannot be used whatever is sent, and is not counted). wins: [(remaining $, limit $, reset, length min)]."""
-    if not wins or not samples:
-        return None
+def leftover_points(wins, t):
+    """The times in (t, T] where some window's period changes, and T (leftover_horizon): the forecast paths are needed at these."""
     T = leftover_horizon(wins)
-    cap = min(m + L * max(0, math.ceil((T - r) / (win * 60) - 1e-9)) for m, L, r, win in wins)
-    return sum(max(0.0, cap - v) for v in samples) / len(samples)
+    pts = {T}
+    for w in wins:
+        b = w['r']
+        while b < T:
+            pts.add(b)
+            b += w['len'] * 60
+    return sorted(p for p in pts if p > t)
+
+
+def contract_leftover(wins, paths, t):
+    """Expected cost ($) the side's contract leaves unused although it could be used, until T = leftover_horizon(wins).
+    For each forecast path (the use without a limit, cumulated at leftover_points): between those points, the use actually possible is the path's use cut
+    by every window's remaining amount in its period at that time (the current period: what remains now; each later period that starts before T: the whole
+    limit); then the cost that could still be used is added greedily, segment by segment, as far as every window's period allows. The expected leftover
+    is the mean of that addition. A window whose periods allow more than another one does not bind; use beyond a period's limit cannot move to another
+    period, so a short window binds period by period, not by its sum.
+    wins: [{'m': remaining $, 'L': limit $, 'r': reset, 'len': length min, 'lo', 'hi'}]; paths: [[cumulated use at each of leftover_points]]."""
+    if not wins or not paths:
+        return None
+    pts = leftover_points(wins, t)
+
+    def period(w, a):
+        return 0 if a < w['r'] else 1 + int((a - w['r']) // (w['len'] * 60))
+    segs = []
+    prev_p = t
+    for p in pts:
+        segs.append([(i, period(w, prev_p)) for i, w in enumerate(wins)])
+        prev_p = p
+    tot = 0.0
+    for path in paths:
+        rem = {}
+
+        def room(seg):
+            return min(rem.setdefault((i, k), wins[i]['m'] if k == 0 else wins[i]['L']) for i, k in seg)
+        prev_c = 0.0
+        for seg, c in zip(segs, path):
+            a = min(max(c - prev_c, 0.0), room(seg))
+            for key in seg:
+                rem[key] -= a
+            prev_c = c
+        add = 0.0
+        for seg in segs:
+            a = max(room(seg), 0.0)
+            for key in seg:
+                rem[key] -= a
+            add += a
+        tot += add
+    return tot / len(paths)
 
 
 def window_states(rows, t, log=None, n=N_SAMP):
@@ -964,21 +1122,25 @@ def window_states(rows, t, log=None, n=N_SAMP):
             name = f'{side}-{row_id(x)}'
             ser = sers.get(row_id(x))
             if side == 'codex' and x.get('win'):
-                win, known = int(x['win']), True                  # the length the API gave (Codex; Claude rows of earlier versions held a fixed length)
+                win, known, lo, hi = int(x['win']), True, int(x['win']), int(x['win'])   # the length the API gave (Codex)
             elif ser:
-                win, known = ser.win_min, ser.known               # estimated from the reads (Claude: the API gives no length)
+                win, known, lo, hi = ser.win_min, ser.known, ser.lo, ser.hi   # estimated from the reads (Claude: the API gives no length)
             else:
                 out[side][name] = {'u': float(x['u']), 'r': x.get('r'), 'win': None, 'scoped': bool(x.get('scoped')), 'X': None, 'limit_usd': None,
                                    'limit_src': None, 'rem_h': None, 'note': 'length unknown (no period has been read yet), not used'}
                 continue
             u = float(x['u'])
             r, passed = x.get('r'), False
+            contiguous = ser.contiguous if ser else None
             if r and r <= t:   # the window has reset since the read (a record used instead of a read): a new period, counted from 0
-                r, u, passed = r + (int((t - r) // (win * 60)) + 1) * win * 60, 0.0, True
-            elif not r:
+                passed, u = True, 0.0
+                # periods that follow on at once (seen in the records): the next reset is a length later; otherwise a period starts at the next use,
+                # so it ends at the earliest a length after now
+                r = r + (int((t - r) // (win * 60)) + 1) * win * 60 if contiguous else t + win * 60
+            elif not r:        # no period running: one starting now would end a length later
                 r = t + win * 60
-            st = {'u': u, 'r': r, 'win': win, 'win_known': known, 'scoped': bool(x.get('scoped')), 'X': None, 'limit_usd': None, 'limit_src': None,
-                  'rem_h': (r - t) / 3600}
+            st = {'u': u, 'r': r, 'win': win, 'win_known': known, 'win_lo': lo, 'win_hi': hi if hi != math.inf else None,
+                  'scoped': bool(x.get('scoped')), 'X': None, 'limit_usd': None, 'limit_src': None, 'rem_h': (r - t) / 3600}
             out[side][name] = st
             if passed:
                 notes.append(f'{name}: reset after the read used ({time.strftime("%H:%M:%S", time.localtime(x["ts"]))}); usage counted from 0')
@@ -1006,8 +1168,11 @@ def window_states(rows, t, log=None, n=N_SAMP):
                     continue
                 st['X'] = sum(1 for v in s if v >= m) / len(s)
             if not need_u and all(st['X'] is not None for st, _, _ in need):
-                wins = [(m, st['limit_usd'], st['r'], st['win']) for st, _, m in need]
-                left[side] = contract_leftover(wins, smp[leftover_horizon(wins) - t], t)
+                wins = [{'m': m, 'L': st['limit_usd'], 'r': st['r'], 'len': st['win'], 'lo': st['win_lo'],
+                         'hi': st['win_hi'] if st['win_hi'] is not None else math.inf} for st, _, m in need]
+                pts = leftover_points(wins, t)
+                paths = forecast_paths(unheld([e for e in ev if e[0] < t], held), t, [p - t for p in pts], n=n)
+                left[side] = contract_leftover(wins, paths, t)
         # windows with no cost to estimate from: the same forecast on the window's own usage growth (limit 100%). The current read is included even if not yet recorded
         for st, x in need_u:
             ser = load_series(side, log + [{**x, 'ts': x.get('ts') or int(t), 'r': st['r'], 'u': st['u'], 'win': st['win'] if side == 'codex' else None}]).get(row_id(x))
@@ -1029,12 +1194,15 @@ def decide_states(states, main=MAIN, guard=GUARD_RISK, default=TIE_DEFAULT, left
     use = {s: {k: v for k, v in states.get(s, {}).items() if not v.get('scoped')} for s in ('claude', 'codex')}
 
     def leftover(d):
-        # the window whose unused amount is lost: the longest (a shorter window's leftover is still held by it); the least if several are as long
+        # the window whose unused amount is lost: the longest (a shorter window's leftover is still held by it); every window that may be the longest
+        # within the estimate of the lengths counts, and the least is taken. None without any X (the side cannot be compared)
         v = [x for x in d.values() if x['X'] is not None]
         if not v:
-            return 0.5
-        longest = max(x['win'] for x in v)   # the length the API gave, or estimated from the reads
-        return min(1 - x['X'] for x in v if x['win'] == longest)
+            return None
+        lo = {id(x): x.get('win_lo', x['win']) for x in v}
+        hi = {id(x): x.get('win_hi', x['win']) if x.get('win_hi', x['win']) is not None else math.inf for x in v}
+        top = max(lo.values())
+        return min(1 - x['X'] for x in v if hi[id(x)] >= top)
     full = {s: [k for k, v in use[s].items() if v['u'] >= FULL] for s in use}
     over = [k for k, v in use[main].items() if v['X'] is not None and v['X'] > guard]
     L = {s: leftover(use[s]) for s in use}
@@ -1052,7 +1220,7 @@ def decide_states(states, main=MAIN, guard=GUARD_RISK, default=TIE_DEFAULT, left
         a, b, stage = why['claude_left_usd'], why['codex_left_usd'], 'leftover'
     else:   # a side has no limit in cost: the leftover cannot be compared in cost; compare the leftover probability instead
         a, b, stage = L['claude'], L['codex'], 'leftover_prob'
-    if a == b:
+    if a is None or b is None or a == b:   # equal, or a side without any exhaust probability (nothing to compare)
         return default, dict(why, stage='tie', tie=True)
     return ('claude' if a > b else 'codex'), dict(why, stage=stage)
 
@@ -1136,35 +1304,21 @@ def read_claude(t, notes=None):
     return out
 
 
-def _codex_windows(v, path=()):
-    """Every object with used_percent and limit_window_seconds under v, with its path of keys (any number of windows)."""
-    if isinstance(v, dict):
-        if v.get('used_percent') is not None and v.get('limit_window_seconds'):
-            yield path, v
-            return
-        for k, x in v.items():
-            yield from _codex_windows(x, path + (str(k),))
-    elif isinstance(v, list):
-        for i, x in enumerate(v):
-            yield from _codex_windows(x, path + (str(i),))
-
-
 def parse_codex(d):
-    """ChatGPT usage response (/backend-api/wham/usage) → [{side, id, win, u, r, scoped}]. Every window in the response (any number; the API gives the
-    length). Windows under rate_limit (the plan's agent features, including Codex) are named by their length and used; windows elsewhere
-    (additional_rate_limits, code_review_rate_limit, ...: what they apply to is not known) are shown only (scoped), named by their place."""
-    out, seen = [], set()
-    for path, w in _codex_windows(d or {}):
+    """ChatGPT usage response (/backend-api/wham/usage) → [{side, id, win, u, r, place?}]: every window in the response (any number, any key; the API
+    gives the length), all used for the decision (what a window applies to is not given, so none is set aside by its key). The kind is the exact length
+    (row_id: in days, hours or minutes, whichever divides it), with its place in the response when two windows are as long."""
+    found = []
+    for path, w in _windows_in(d or {}, ('used_percent', 'limit_window_seconds')):
         r = w.get('reset_at') or (time.time() + w['reset_after_seconds'] if w.get('reset_after_seconds') is not None else None)
-        if not r:
-            continue
-        win = int(w['limit_window_seconds']) // 60
-        main = bool(path) and path[0] == 'rate_limit'
-        wid = win_label(win) if main else '.'.join(path) + ':' + win_label(win)
-        if wid in seen:
-            wid += ':' + '.'.join(path)
-        seen.add(wid)
-        out.append({'side': 'codex', 'id': wid, 'win': win, 'u': float(w['used_percent']), 'r': int(r), **({} if main else {'scoped': True})})
+        if r:
+            found.append((path, w, int(w['limit_window_seconds']) // 60, int(r)))
+    lens = [win for _, _, win, _ in found]
+    out = []
+    for path, w, win, r in found:
+        x = {'side': 'codex', 'win': win, 'u': float(w['used_percent']), 'r': r, **({'place': '.'.join(path)} if lens.count(win) > 1 else {})}
+        x['id'] = row_id(x)
+        out.append(x)
     return out
 
 
@@ -1291,8 +1445,8 @@ def decide_now(t, main=MAIN):
             res['windows'][k] = {kk: (round(vv, 4) if isinstance(vv, float) else vv) for kk, vv in v.items()}
     if states['claude'] and states['codex']:
         pick, why = decide_states(states, main, left_usd=left)
-        res.update(pick=pick, tie=why['tie'], guard=why['guard'], full=why['full'], claude_L=round(why['claude_L'], 4),
-                   codex_L=round(why['codex_L'], 4), reason=why['stage'],
+        res.update(pick=pick, tie=why['tie'], guard=why['guard'], full=why['full'],
+                   **{f'{s}_L': (round(why[f'{s}_L'], 4) if why[f'{s}_L'] is not None else None) for s in ('claude', 'codex')}, reason=why['stage'],
                    **{f'{s}_left_usd': (round(why[f'{s}_left_usd'], 2) if why[f'{s}_left_usd'] is not None else None) for s in ('claude', 'codex')})
         miss = [s for s in ('claude', 'codex') if why[f'{s}_left_usd'] is None]
         if miss:
@@ -1327,13 +1481,17 @@ def print_human(res):
         if v.get('win') is None:
             print(f'  {k}: used {v["u"]:.0f}%  {v.get("note", "")}')
             continue
-        lab = win_label(v['win']) + ('' if v.get('win_known', True) else ', at least')
-        print(f'  {k} ({lab}): used {v["u"]:.0f}%  resets {f(v["r"])} (in {v["rem_h"]:.1f} h){extra}')
-    if res['claude_L'] is not None:
+        # the length in parentheses, unless the name already is the length (Codex: named by the exact length the API gave)
+        lab = '' if k.startswith('codex-') else ' (' + win_label(v['win']) + ('' if v.get('win_known', True) else ', at least') + ')'
+        print(f'  {k}{lab}: used {v["u"]:.0f}%  resets {f(v["r"])} (in {v["rem_h"]:.1f} h){extra}')
+    if res['reason'] in ('full', 'guard', 'tie', 'leftover', 'leftover_prob'):
         def usd(v):
             return f'${v:,.0f}' if v is not None else 'unknown'
+
+        def pr(v):
+            return f'{v:.2f}' if v is not None else 'unknown'
         print(f'  expected leftover Claude {usd(res["claude_left_usd"])} / Codex {usd(res["codex_left_usd"])}'
-              f'  (leftover probability Claude {res["claude_L"]:.2f} / Codex {res["codex_L"]:.2f})  guard {res["guard"] or "none"}'
+              f'  (leftover probability Claude {pr(res["claude_L"])} / Codex {pr(res["codex_L"])})  guard {res["guard"] or "none"}'
               f'  full {res["full"] or "none"}')
 
 

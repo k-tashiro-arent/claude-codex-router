@@ -152,7 +152,8 @@ assert w['claude-session']['win_known'] is False and w['claude-session']['win'] 
 assert w['claude-weekly_scoped:Fable']['scoped'] and not w['claude-weekly_all']['scoped']
 # there are conversation logs, but the cost in the current windows is still 0 (no limit in cost): X comes from usage growth
 assert all(v['basis'] == 'usage' for k, v in w.items() if not v['scoped']) and w['codex-7d']['X'] is not None, w
-assert 0 <= d['claude_L'] <= 1 and 0 <= d['codex_L'] <= 1 and not d['errors'] and 'sub_tight' not in d and d['full'] == []
+# Claude: the length is only a lower bound on the first read, so its usage growth gives no X yet (claude_L null: nothing to compare)
+assert (d['claude_L'] is None or 0 <= d['claude_L'] <= 1) and 0 <= d['codex_L'] <= 1 and not d['errors'] and 'sub_tight' not in d and d['full'] == []
 # no limit in cost, so the expected leftover in cost is unknown and the comparison uses the leftover probability
 assert d['claude_left_usd'] is None and d['codex_left_usd'] is None and d['reason'] in ('leftover_prob', 'tie', 'guard'), d
 assert 'limit unknown in cost' in w['codex-7d']['note'], w['codex-7d']
@@ -196,7 +197,7 @@ n0=$(wc -l < "$DIR/data/usage.jsonl")
 set +e
 out=$(python3 "$DIR/bin/router.py" now --json); code=$?
 set -e
-if [[ $code != 0 ]] || ! python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["pick"] in ("claude","codex") and not d["errors"] and "429" in d["notes"][0] and d["windows"]["claude-weekly_all"]["u"]==20 and d["claude_L"] is not None' "$out"; then
+if [[ $code != 0 ]] || ! python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["pick"] in ("claude","codex") and not d["errors"] and "429" in d["notes"][0] and d["windows"]["claude-weekly_all"]["u"]==20 and d["reason"] in ("tie", "leftover_prob", "leftover", "guard")' "$out"; then
   fail "on 429 (exit code $code, $out)"
 fi
 [[ "$(wc -c < "$work/hits")" -eq 1 ]] || fail "called again after 429 ($(wc -c < "$work/hits") times)"
