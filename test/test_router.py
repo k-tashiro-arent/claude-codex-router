@@ -203,8 +203,40 @@ class CostLogTests(TempDirCase):
         os.remove(route.COST_STATE)
         self.assertEqual(route.sync_costs(full=True)['usage'], 0)    # even when everything is read again, overlapping rows are not added
         rows = route.read_log()
-        self.assertEqual(sorted((x['side'], x['win'], x['u']) for x in rows),
-                         [('claude', 300, 12.0), ('claude', 10080, 30.0), ('codex', 10080, 10.0), ('codex', 10080, 11.0)])
+        self.assertEqual(sorted((x['side'], route.row_id(x), x.get('win'), x['u']) for x in rows),
+                         [('claude', 'legacy:d7', None, 30.0), ('claude', 'legacy:h5', None, 12.0), ('codex', '7d', 10080, 10.0), ('codex', '7d', 10080, 11.0)])
+        # the imported Claude rows carry the file's field names only; load_series joins them to the API's kinds by the reset times
+
+
+class LengthTests(unittest.TestCase):
+    def test_length_from_the_reads(self):
+        # periods of 5 h starting at first use; reads every 5 min. A period read 4 min after it started gives about 296 min; the largest is taken
+        H5 = 300 * 60
+        reads = [(0, None), (300, None), (540, 540 + H5 - 240), (840, 540 + H5 - 240),        # started at 300..540, first read at 540
+                 (40000, None), (40300, 40300 + H5 - 60)]                                       # first read 1 min after the start
+        est, known = route.estimate_length(reads)
+        self.assertAlmostEqual(est, 299.0)
+        self.assertTrue(known)
+
+    def test_only_a_lower_bound_without_a_bracketed_start(self):
+        est, known = route.estimate_length([(1000, 1000 + 3 * 86400)])         # one read, 3 days before the reset (the period may be longer)
+        self.assertEqual((est, known), (3 * 1440, False))
+        self.assertEqual(route.estimate_length([]), (None, False))
+
+    def test_claude_rows_get_the_estimated_length(self):
+        t = 10 * 86400.0
+        r_prev = t - 4 * 86400
+        log = [{'ts': int(r_prev - 300), 'side': 'claude', 'id': 'weekly_all', 'u': 60.0, 'r': int(r_prev)},
+               {'ts': int(r_prev + 60), 'side': 'claude', 'id': 'weekly_all', 'u': 0.0, 'r': int(r_prev + 7 * 86400)}]
+        ser = route.load_series('claude', log)['weekly_all']
+        self.assertAlmostEqual(ser.win_min, 7 * 1440 - 1)
+        self.assertTrue(ser.known)
+
+    def test_limit_not_from_the_current_window_while_the_start_is_unknown(self):
+        t = at('2026-10-07 12:00')
+        cs_ = route.CostSeries([(t - 3600, 50.0)], t)
+        self.assertEqual(route.limit_usd(None, cs_, 50.0, t, t + 3600, 120, known=False), (None, None))
+        self.assertEqual(route.limit_usd(None, cs_, 50.0, t, t + 3600, 120, known=True), (100.0, 'now'))
 
 
 class ParseTests(unittest.TestCase):
@@ -217,14 +249,16 @@ class ParseTests(unittest.TestCase):
             {'kind': 'monthly_x', 'group': 'monthly', 'percent': 5, 'resets_at': '2026-11-01T00:00:00+00:00', 'scope': None}]}
         notes = []
         rows = route.parse_claude(d, notes)
-        self.assertEqual([(x['id'], x['win'], x['u'], x['scoped']) for x in rows],
-                         [('session', 300, 32.0, False), ('weekly_all', 10080, 18.0, False), ('weekly_scoped:Fable', 10080, 0.0, True)])
-        self.assertIn('monthly_x', notes[0])
+        # every kind is taken, unknown ones too; no length (the API gives none; it is estimated from the reads)
+        self.assertEqual([(x['id'], x['u'], x['scoped']) for x in rows],
+                         [('session', 32.0, False), ('weekly_all', 18.0, False), ('weekly_scoped:Fable', 0.0, True), ('monthly_x', 5.0, False)])
+        self.assertTrue(all('win' not in x for x in rows))
+        self.assertEqual(notes, [])
 
     def test_claude_old_shape(self):
         d = {'five_hour': {'utilization': 12.0, 'resets_at': '2026-10-07T19:59:59+00:00'},
              'seven_day': {'utilization': 40.0, 'resets_at': '2026-10-14T05:59:59+00:00'}}
-        self.assertEqual([(x['id'], x['win']) for x in route.parse_claude(d)], [('session', 300), ('weekly_all', 10080)])
+        self.assertEqual([(x['id'], x.get('win')) for x in route.parse_claude(d)], [('five_hour', None), ('seven_day', None)])   # the kind is the key
 
     def test_codex_windows_by_length(self):
         d = {'rate_limit': {'allowed': True, 'primary_window': {'used_percent': 35, 'limit_window_seconds': 604800, 'reset_after_seconds': 9,
@@ -237,11 +271,32 @@ class ParseTests(unittest.TestCase):
         self.assertAlmostEqual(rows[1]['r'], time.time() + 60, delta=5)
         self.assertEqual(route.parse_codex({'rate_limit': {'primary_window': None, 'secondary_window': None}}), [])
 
-    def test_old_rows_get_ids_from_length(self):
-        self.assertEqual(route.row_id({'side': 'claude', 'win': 300}), 'session')
-        self.assertEqual(route.row_id({'side': 'claude', 'win': 10080}), 'weekly_all')
+    def test_codex_any_number_of_windows(self):
+        # a third window under rate_limit is used; windows elsewhere (what they apply to is not known) are shown only
+        d = {'rate_limit': {'primary_window': {'used_percent': 1, 'limit_window_seconds': 604800, 'reset_at': 2000000000},
+                            'tertiary_window': {'used_percent': 2, 'limit_window_seconds': 2592000, 'reset_at': 2000000000}},
+             'additional_rate_limits': [{'limit_name': 'x', 'rate_limit': {'primary_window': {'used_percent': 3, 'limit_window_seconds': 18000,
+                                                                                                'reset_at': 2000000000}}}],
+             'code_review_rate_limit': None}
+        rows = route.parse_codex(d)
+        self.assertEqual([(x['win'], x['u'], bool(x.get('scoped'))) for x in rows], [(10080, 1.0, False), (43200, 2.0, False), (300, 3.0, True)])
+
+    def test_rows_without_id(self):
+        # Claude: a provisional kind (joined by reset times in load_series), not a kind decoded from a length; Codex: by the length the API gave
+        self.assertEqual(route.row_id({'side': 'claude', 'win': 300}), 'legacy:300')
+        self.assertEqual(route.row_id({'side': 'claude', 'tp': 'x'}), 'legacy:x')
         self.assertEqual(route.row_id({'side': 'codex', 'win': 300}), '5h')
         self.assertEqual(route.row_id({'side': 'claude', 'win': 10080, 'id': 'weekly_scoped:Fable'}), 'weekly_scoped:Fable')
+
+    def test_rows_without_id_join_the_kind_with_the_same_resets(self):
+        t = 1_000_000.0
+        log = [{'ts': t, 'side': 'claude', 'id': 'session', 'u': 10.0, 'r': t + 3600},
+               {'ts': t - 600, 'side': 'claude', 'win': 300, 'u': 8.0, 'r': t + 3601},            # an earlier version's row, the same period
+               {'ts': t - 900, 'side': 'claude', 'tp': 'k', 'u': 7.0, 'r': t + 3599},             # an imported row, the same period
+               {'ts': t, 'side': 'claude', 'tp': 'other', 'u': 1.0, 'r': t + 9 * 86400}]          # matches no kind: stays apart
+        sers = route.load_series('claude', log)
+        self.assertEqual(sorted(sers), ['legacy:other', 'session'])
+        self.assertEqual([u for _, u in sers['session'].groups[0]['pts']], [7.0, 8.0, 10.0])
 
 
 class CleanPointsTests(unittest.TestCase):
@@ -355,25 +410,21 @@ class DecideTests(unittest.TestCase):
         s = {'claude': {'claude-weekly_all': self.st(10, 0.0)}, 'codex': {'codex-7d': self.st(90, 0.95)}}
         self.assertEqual(route.decide_states(s, 'codex')[0], 'claude')      # if the main side is Codex, Codex's guard sends it to Claude
 
-    def test_guard_on_both_sides_goes_to_the_comparison(self):
-        # the main side's weekly window is over guard, but the sub side's is nearer its limit: sending to the sub side would use it up first
+    def test_guard_on_main_goes_to_sub_whatever_the_sub_side(self):
+        # the sub side has no guard: if it reaches its limit, work returns to the main side, so only the main side's X counts
         s = {'claude': {'claude-weekly_all': self.st(61, 0.595)}, 'codex': {'codex-7d': self.st(83, 0.618)}}
-        pick, why = route.decide_states(s, 'claude')
-        self.assertEqual((pick, why['stage'], why['guard'], why['sub_tight']), ('claude', 'leftover', [], []))
+        pick, why = route.decide_states(s, 'claude', left_usd={'claude': 100.0, 'codex': 5.0})
+        self.assertEqual((pick, why['stage'], why['guard']), ('codex', 'guard', ['claude-weekly_all']))
         s = {'claude': {'claude-session': self.st(80, 0.7, 300), 'claude-weekly_all': self.st(10, 0.0)},
              'codex': {'codex-7d': self.st(90, 0.95)}}
-        self.assertEqual(route.decide_states(s, 'claude')[0], 'claude')
+        self.assertEqual(route.decide_states(s, 'claude')[0], 'codex')
 
-    def test_sub_long_window_tight_keeps_main(self):
-        s = {'claude': {'claude-weekly_all': self.st(10, 0.2)}, 'codex': {'codex-7d': self.st(80, 0.7)}}
-        pick, why = route.decide_states(s, 'claude')
-        self.assertEqual((pick, why['stage'], why['sub_tight']), ('claude', 'guard', ['codex-7d']))
-
-    def test_sub_short_window_tight_keeps_main(self):
-        s = {'claude': {'claude-weekly_all': self.st(10, 0.0)},
-             'codex': {'codex-5h': self.st(70, 0.8, 300), 'codex-7d': self.st(5, 0.0)}}
-        pick, why = route.decide_states(s, 'claude')
-        self.assertEqual((pick, why['sub_tight']), ('claude', ['codex-5h']))
+    def test_sub_side_over_guard_does_not_keep_main(self):
+        # Codex (sub) is likely to reach its limit, Claude (main) is not: decided by the comparison, not kept on main
+        s = {'claude': {'claude-weekly_all': self.st(10, 0.2)}, 'codex': {'codex-5h': self.st(70, 0.8, 300), 'codex-7d': self.st(80, 0.7)}}
+        pick, why = route.decide_states(s, 'claude', left_usd={'claude': 20.0, 'codex': 60.0})
+        self.assertEqual((pick, why['stage'], why['guard']), ('codex', 'leftover', []))
+        self.assertNotIn('sub_tight', why)
 
     def test_full_side_is_never_chosen(self):
         s = {'claude': {'claude-weekly_all': self.st(99, None)}, 'codex': {'codex-7d': self.st(97, 0.99)}}
@@ -398,15 +449,97 @@ class DecideTests(unittest.TestCase):
         sub_full = {'claude': {'claude-weekly_all': self.st(40, 0.7)}, 'codex': {'codex-7d': self.st(99, None)}}
         pick, why = route.decide_states(sub_full, 'claude')
         self.assertEqual((pick, why['stage'], why['guard']), ('claude', 'full', []))
-        both_tight = {'claude': {'claude-weekly_all': self.st(40, 0.7)},
-                      'codex': {'codex-5h': self.st(70, 0.8, 300), 'codex-7d': self.st(5, 0.0)}}
-        pick, why = route.decide_states(both_tight, 'claude')
-        self.assertEqual((pick, why['stage'], why['guard'], why['sub_tight']), ('claude', 'leftover', [], []))   # Codex's 5-hour window (0.2) is compared too
+        no_guard = {'claude': {'claude-weekly_all': self.st(40, 0.3)},
+                    'codex': {'codex-5h': self.st(70, 0.8, 300), 'codex-7d': self.st(5, 0.0)}}
+        pick, why = route.decide_states(no_guard, 'claude')
+        self.assertEqual((pick, why['stage'], why['guard']), ('codex', 'leftover_prob', []))   # the longest windows are compared: Codex 1.0 > Claude 0.7
 
     def test_tie_follows_default(self):
         s = {'claude': {'claude-weekly_all': self.st(10, 0.2)}, 'codex': {'codex-7d': self.st(10, 0.2)}}
         self.assertEqual(route.decide_states(s, 'claude', default='codex')[0], 'codex')
         self.assertTrue(route.decide_states(s, 'claude')[1]['tie'])
+
+    def test_compare_by_expected_leftover_cost(self):
+        # the comparison is by the expected leftover $, not by the probability: Claude is likelier to leave something, but Codex leaves more
+        s = {'claude': {'claude-weekly_all': self.st(40, 0.1)}, 'codex': {'codex-7d': self.st(20, 0.4)}}
+        pick, why = route.decide_states(s, 'claude', left_usd={'claude': 30.0, 'codex': 120.0})
+        self.assertEqual((pick, why['stage'], why['claude_left_usd'], why['codex_left_usd']), ('codex', 'leftover', 30.0, 120.0))
+        pick, why = route.decide_states(s, 'claude', left_usd={'claude': 50.0, 'codex': 50.0}, default='claude')
+        self.assertEqual((pick, why['stage'], why['tie']), ('claude', 'tie', True))
+
+    def test_gates_come_before_the_cost_comparison(self):
+        s = {'claude': {'claude-weekly_all': self.st(80, 0.7)}, 'codex': {'codex-7d': self.st(20, 0.1)}}
+        pick, why = route.decide_states(s, 'claude', left_usd={'claude': 500.0, 'codex': 10.0})
+        self.assertEqual((pick, why['stage']), ('codex', 'guard'))
+        s = {'claude': {'claude-weekly_all': self.st(99, 0.99)}, 'codex': {'codex-7d': self.st(20, 0.1)}}
+        self.assertEqual(route.decide_states(s, 'codex', left_usd={'claude': 500.0, 'codex': 10.0})[1]['stage'], 'full')
+
+    def test_probability_comparison_uses_the_longest_window(self):
+        # without cost, the leftover probability of the longest window: Claude's 5-hour window (likely to be used up) does not count
+        s = {'claude': {'claude-session': self.st(80, 0.45, 300), 'claude-weekly_all': self.st(20, 0.05)}, 'codex': {'codex-7d': self.st(20, 0.2)}}
+        pick, why = route.decide_states(s, 'claude')
+        self.assertEqual((pick, why['stage']), ('claude', 'leftover_prob'))
+        self.assertAlmostEqual(why['claude_L'], 0.95)
+
+    def test_side_without_cost_falls_back_to_probability(self):
+        s = {'claude': {'claude-weekly_all': self.st(40, 0.1)}, 'codex': {'codex-7d': self.st(20, 0.4)}}
+        pick, why = route.decide_states(s, 'claude', left_usd={'claude': 30.0, 'codex': None})
+        self.assertEqual((pick, why['stage']), ('claude', 'leftover_prob'))
+        self.assertEqual(route.decide_states(s, 'claude')[1]['stage'], 'leftover_prob')
+
+
+class OneSideTests(unittest.TestCase):
+    def st(self, u, X, win=10080):
+        return {'u': u, 'X': X, 'win': win, 'scoped': False}
+
+    def test_readable_side_is_chosen(self):
+        self.assertEqual(route.decide_one_side({'claude': {'claude-weekly_all': self.st(20, 0.1)}, 'codex': {}}, 'claude'),
+                         ('claude', 'codex_unreadable', []))
+        self.assertEqual(route.decide_one_side({'claude': {}, 'codex': {'codex-7d': self.st(90, 0.9)}}, 'claude'),
+                         ('codex', 'claude_unreadable', []))          # the sub side has no guard
+
+    def test_main_over_guard_goes_to_the_unread_sub_side(self):
+        s = {'claude': {'claude-session': self.st(80, 0.7, 300), 'claude-weekly_all': self.st(20, 0.1)}, 'codex': {}}
+        self.assertEqual(route.decide_one_side(s, 'claude'), ('codex', 'guard', ['claude-session']))
+
+
+class ContractLeftoverTests(unittest.TestCase):
+    def test_single_window(self):
+        # remaining $100; use until the reset 30 or 150 → leftover 70 or 0
+        self.assertAlmostEqual(route.contract_leftover([(100.0, 200.0, 1000.0, 10080)], [30.0, 150.0], 0.0), 35.0)
+
+    def test_short_window_does_not_bind_when_its_periods_allow_more(self):
+        # 5-hour window: $150 left, resets in 2 h, limit $170; weekly: $260 left, resets in 24 h. Until 24 h the 5-hour window allows 150 + 170·22/5 > 260
+        t = 0.0
+        wins = [(150.0, 170.0, t + 2 * 3600, 300), (260.0, 1100.0, t + 24 * 3600, 10080)]
+        self.assertAlmostEqual(route.contract_leftover(wins, [100.0], t), 160.0)
+
+    def test_short_window_binds_when_it_allows_less(self):
+        # the 5-hour window allows 10 + 20 (one more period starts before the longer window's reset in 6 h) = 30, less than the longer one's 500
+        t = 0.0
+        wins = [(10.0, 20.0, t + 2 * 3600, 300), (500.0, 1100.0, t + 6 * 3600, 10080)]
+        self.assertAlmostEqual(route.contract_leftover(wins, [0.0, 6.0], t), 27.0)
+
+    def test_a_started_period_counts_whole(self):
+        # the 5-hour window resets in 1 minute, 2 minutes before the longer window's reset: the new period's whole $170 can be used
+        t = 0.0
+        wins = [(10.0, 170.0, t + 60, 300), (500.0, 1100.0, t + 180, 10080)]
+        self.assertAlmostEqual(route.contract_leftover(wins, [0.0], t), 180.0)
+
+    def test_longest_window_resetting_first(self):
+        # weekly: $200 left, resets in 1 h; 5-hour window: $100 left, resets in 5 h. The weekly amount is lost in 1 h; until then only $100 can be used
+        # (the 5-hour window), so with $8 used, $92 could have been used but is not. The use after the weekly reset (new weekly amount) does not count
+        t = 0.0
+        wins = [(200.0, 1090.0, t + 3600, 10080), (100.0, 170.0, t + 5 * 3600, 300)]
+        self.assertEqual(route.leftover_horizon(wins), t + 3600)
+        self.assertAlmostEqual(route.contract_leftover(wins, [4.0, 8.0, 12.0], t), 92.0)
+
+    def test_horizon_is_the_longest_window_not_the_latest_reset(self):
+        self.assertEqual(route.leftover_horizon([(1.0, 1.0, 50.0, 300), (1.0, 1.0, 10.0, 10080), (1.0, 1.0, 30.0, 10080)]), 10.0)
+
+    def test_no_windows_or_samples(self):
+        self.assertIsNone(route.contract_leftover([], [1.0], 0.0))
+        self.assertIsNone(route.contract_leftover([(1.0, 2.0, 3.0, 300)], None, 0.0))
 
 
 class ForecastTests(unittest.TestCase):
@@ -488,6 +621,13 @@ class ForecastTests(unittest.TestCase):
         self.assertEqual([e for e in un if e[0] < t0 + 48 * H], ev)
 
 
+def bracket(kind, r, length_min, side='claude'):
+    """Reads just before and after the start of the period ending at r: the window's length is known from the records (the API gives none for Claude)."""
+    start = r - length_min * 60
+    return [{'ts': int(start - 120), 'side': side, 'id': kind, 'u': 50.0, 'r': int(start)},
+            {'ts': int(start + 60), 'side': side, 'id': kind, 'u': 0.0, 'r': int(r)}]
+
+
 class WindowStateTests(TempDirCase):
     def test_probability_from_cost_and_usage(self):
         t = at('2026-10-07 12:00')
@@ -504,7 +644,7 @@ class WindowStateTests(TempDirCase):
         r = t + 2 * D
         live = [{'side': 'claude', 'id': 'weekly_all', 'win': 10080, 'u': 45.0, 'r': int(r)},
                 {'side': 'claude', 'id': 'weekly_scoped:Fable', 'win': 10080, 'u': 0.0, 'r': int(r), 'scoped': True}]
-        states, notes = route.window_states(live, t, log=[], n=200)
+        states, notes, left = route.window_states(live, t, log=bracket('weekly_all', r, 10080), n=200)
         w = states['claude']['claude-weekly_all']
         self.assertEqual(w['limit_src'], 'now')
         self.assertAlmostEqual(w['limit_usd'], 100 * 450 / 45, delta=60)     # $450 since the window start (5 days ago)
@@ -512,13 +652,29 @@ class WindowStateTests(TempDirCase):
         self.assertLess(w['X'], 0.5)                                         # about $550 remaining, and only about $200 is used in 2 days
         self.assertIsNone(states['claude']['claude-weekly_scoped:Fable']['X'])
         self.assertEqual(notes, [])
+        self.assertGreater(left['claude'], 0)                                # some of the $550 is expected to be left (the scoped window is not used)
+        self.assertLess(left['claude'], w['remain_usd'])
+        self.assertIsNone(left['codex'])
+
+    def test_read_whose_reset_has_passed_starts_a_new_period(self):
+        # a record read before the reset (e.g. used instead on 429): the window has reset since, so usage is 0 and the period ends one length later
+        t = at('2026-10-07 12:00')
+        self.write_costs('claude', [{'k': 'a', 'ts': t - 3 * H, 'model': 'claude-opus-5-5', 'out': 125000}])
+        states, notes, _ = route.window_states([{'side': 'claude', 'id': 'session', 'u': 99.0, 'r': int(t - 60), 'ts': int(t - 300)}], t,
+                                               log=bracket('session', t - 60, 300))
+        w = states['claude']['claude-session']
+        self.assertEqual(w['u'], 0.0)
+        self.assertAlmostEqual(w['r'], int(t - 60) + 300 * 60, delta=120)      # the length is estimated from the reads (within the read interval)
+        self.assertTrue(any('reset after the read' in x for x in notes))
+        self.assertEqual(route.decide_states({'claude': states['claude'], 'codex': {'codex-7d': {'u': 10, 'X': 0.1, 'win': 10080}}}, 'claude')[1]['full'], [])
 
     def test_probability_from_less_than_a_day_of_cost(self):
         t = at('2026-10-07 12:00')
         rows = [{'k': f'a{q}', 'ts': t - 3 * H + q * 900 + 1, 'model': 'claude-opus-5-5', 'out': 125000} for q in range(12)]
         self.write_costs('claude', rows)                             # about $112 in 3 hours (the cost records cover only 3 hours)
-        states, notes = route.window_states([{'side': 'claude', 'id': 'weekly_all', 'win': 10080, 'u': 10.0, 'r': int(t + 3 * D)},
-                                             {'side': 'claude', 'id': 'session', 'win': 300, 'u': 99.0, 'r': int(t + H)}], t, log=[])
+        states, notes, left = route.window_states([{'side': 'claude', 'id': 'weekly_all', 'win': 10080, 'u': 10.0, 'r': int(t + 3 * D)},
+                                             {'side': 'claude', 'id': 'session', 'win': 300, 'u': 99.0, 'r': int(t + H)}], t,
+                                            log=bracket('weekly_all', t + 3 * D, 10080) + bracket('session', t + H, 300))
         w = states['claude']['claude-weekly_all']
         self.assertEqual(w['limit_src'], 'now')                       # the cost before the records is taken as 0
         self.assertIsNotNone(w['X'])
@@ -528,22 +684,27 @@ class WindowStateTests(TempDirCase):
     def test_probability_from_usage_growth_without_any_cost_record(self):
         # no cost records on this machine (e.g. a new machine): X comes from the window's own usage growth, even when the current read is not in the records yet
         t = at('2026-10-07 12:00')
-        states, notes = route.window_states([{'side': 'codex', 'id': '7d', 'win': 10080, 'u': 90.0, 'r': int(t + 3 * D)},
-                                             {'side': 'claude', 'id': 'weekly_all', 'win': 10080, 'u': 30.0, 'r': int(t + 3 * D)}], t, log=[])
+        r_prev = t - 4 * D                                   # Claude's length is known from reads around the last reset (the API gives none)
+        log = [{'ts': int(r_prev - 300), 'side': 'claude', 'id': 'weekly_all', 'u': 50.0, 'r': int(r_prev)},
+               {'ts': int(r_prev + 60), 'side': 'claude', 'id': 'weekly_all', 'u': 0.0, 'r': int(t + 3 * D)},
+               {'ts': int(t - 2 * D), 'side': 'claude', 'id': 'weekly_all', 'u': 15.0, 'r': int(t + 3 * D)}]
+        states, notes, left = route.window_states([{'side': 'codex', 'id': '7d', 'win': 10080, 'u': 90.0, 'r': int(t + 3 * D)},
+                                             {'side': 'claude', 'id': 'weekly_all', 'u': 30.0, 'r': int(t + 3 * D)}], t, log=log)
         hi, lo = states['codex']['codex-7d'], states['claude']['claude-weekly_all']
         self.assertEqual((hi['basis'], hi['remain_pct']), ('usage', 10.0))
         self.assertGreater(hi['X'], 0.5)                     # 90% in 4 days, 10% left for 3 days
         self.assertLess(lo['X'], 0.5)                        # 30% in 4 days, 70% left for 3 days
         self.assertIn('exhaust probability from usage growth', notes[0])
-        pick, why = route.decide_states(states, 'claude')
-        self.assertEqual((pick, why['stage'], why['sub_tight']), ('claude', 'guard', ['codex-7d']))
+        self.assertEqual(left, {'claude': None, 'codex': None})            # no limit in cost
+        pick, why = route.decide_states(states, 'claude', left_usd=left)
+        self.assertEqual((pick, why['stage']), ('claude', 'leftover_prob'))   # Codex is likelier to be used up (the sub side has no guard; the probability decides)
 
     def test_usage_growth_uses_the_reads_in_the_records(self):
         # reads every hour: 1%/hour for the last day of the window so far. 60% used, 40 hours to the reset → about 40% more → X near the middle, not 0 or 1 only
         t = at('2026-10-07 12:00')
         r = int(t + 40 * H)
         log = [{'ts': int(t - k * H), 'side': 'codex', 'id': '7d', 'win': 10080, 'u': 60.0 - k, 'r': r, 'src': 'live'} for k in range(24, 0, -1)]
-        states, _ = route.window_states([{'side': 'codex', 'id': '7d', 'win': 10080, 'u': 60.0, 'r': r}], t, log=log)
+        states, _, left = route.window_states([{'side': 'codex', 'id': '7d', 'win': 10080, 'u': 60.0, 'r': r}], t, log=log)
         w = states['codex']['codex-7d']
         self.assertEqual(w['basis'], 'usage')
         self.assertIsNotNone(w['X'])
@@ -554,7 +715,11 @@ class WindowStateTests(TempDirCase):
         # there are cost records, but none in this window and no usage history: no limit in cost, so X comes from usage growth
         t = at('2026-10-07 12:00')
         self.write_costs('claude', [{'k': 'a', 'ts': t - 20 * D, 'model': 'claude-opus-5-5', 'out': 1000}])
-        states, _ = route.window_states([{'side': 'claude', 'id': 'weekly_all', 'win': 10080, 'u': 45.0, 'r': int(t + D)}], t, log=[])
+        r_prev = t - 6 * D
+        log = [{'ts': int(r_prev - 300), 'side': 'claude', 'id': 'weekly_all', 'u': 50.0, 'r': int(r_prev)},
+               {'ts': int(r_prev + 60), 'side': 'claude', 'id': 'weekly_all', 'u': 0.0, 'r': int(t + D)},
+               {'ts': int(t - 3 * D), 'side': 'claude', 'id': 'weekly_all', 'u': 20.0, 'r': int(t + D)}]
+        states, _, left = route.window_states([{'side': 'claude', 'id': 'weekly_all', 'u': 45.0, 'r': int(t + D)}], t, log=log)
         w = states['claude']['claude-weekly_all']
         self.assertIsNone(w['limit_usd'])
         self.assertEqual(w['basis'], 'usage')
@@ -616,8 +781,9 @@ class RecordTests(TempDirCase):
         t = at('2026-10-06 10:00')
         route.record([{'ts': t, 'side': 'claude', 'id': 'weekly_scoped:Fable', 'win': 10080, 'u': 3.0, 'r': int(t + D), 'scoped': True},
                       {'ts': t, 'side': 'claude', 'win': 300, 'u': 10.0, 'r': int(t + 2 * H)}])
+        route.record([{'ts': t + 60, 'side': 'claude', 'id': 'session', 'u': 11.0, 'r': int(t + 2 * H)}])
         sers = route.load_series('claude')
-        self.assertEqual(sorted(sers), ['session', 'weekly_scoped:Fable'])
+        self.assertEqual(sorted(sers), ['session', 'weekly_scoped:Fable'])     # the row without id joins session (the same reset)
         self.assertTrue(sers['weekly_scoped:Fable'].scoped)
         self.assertFalse(sers['session'].scoped)
 

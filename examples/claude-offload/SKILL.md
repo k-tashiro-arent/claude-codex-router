@@ -24,7 +24,7 @@ The claude-codex-router installer adds a Codex rule (`~/.codex/rules/claude-code
 ~/.agents/skills/claude-offload/pick.sh --main codex
 ```
 - The output is one line, "`<codex|claude> <reason>`". Follow the first word.
-  - If claude-codex-router (`~/.claude/codex-router/bin/router.py`, location `CLAUDE_CODEX_ROUTER_DIR`) is installed, follow its decision (for both usage windows, the leftover probability before the reset, and the guard).
+  - If claude-codex-router (`~/.claude/codex-router/bin/router.py`, location `CLAUDE_CODEX_ROUTER_DIR`) is installed, follow its decision (for both contracts, the cost expected to be left unused before the reset, and the guard).
   - When it is not installed, did not answer, or its answer is unreadable: `codex` (do it yourself).
 - When delegating several tasks in parallel, call it once for each (every call reads the current usage windows; it takes a few seconds).
 - **claude** → run.sh as in "How to call it" below.

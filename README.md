@@ -19,16 +19,16 @@ Claude のプラン(Pro・Max など)と、Codex を含む ChatGPT のプラン(
 
 ```
 $ python3 ~/.claude/codex-router/bin/router.py now
-pick: codex (reason leftover, main claude)
-  claude-session (5h): used 24%  resets 10-09 13:19 (in 2.7 h)  limit $208 (current window)  remaining $158, exhaust probability 0.03
-  claude-weekly_all (7d): used 38%  resets 10-14 14:59 (in 124.4 h)  limit $1,094 (current window)  remaining $678, exhaust probability 0.50
-  claude-weekly_scoped:Fable (7d): used 0%  resets 10-14 15:00 (in 124.4 h)  model-scoped window (shown only, not used for the decision)
-  codex-7d (7d): used 51%  resets 10-14 12:30 (in 121.9 h)  limit $242 (current window)  remaining $119, exhaust probability 0.47
-  leftover probability Claude 0.50 / Codex 0.53  guard none  sub_tight none  full none
+pick: claude (reason leftover, main claude)
+  claude-session (5h): used 16%  resets 10-13 17:00 (in 1.3 h)  limit $166 (current window)  remaining $139, exhaust probability 0.00
+  claude-weekly_all (7d): used 76%  resets 10-14 15:00 (in 23.3 h)  limit $1,090 (current window)  remaining $261, exhaust probability 0.10
+  claude-weekly_scoped:Fable (7d): used 0%  resets 10-14 15:00 (in 23.3 h)  model-scoped window (shown only, not used for the decision)
+  codex-7d (7d): used 1%  resets 10-20 14:04 (in 166.4 h)  limit $243 (history)  remaining $241, exhaust probability 0.15
+  expected leftover Claude $122 / Codex $105  (leftover probability Claude 0.90 / Codex 0.85)  guard none  full none
 ```
 1 行目が判断(ここでは Codex)です。その下の行は、使用枠ごとの今の使用率(`used`)、リセットの時刻(`resets`)、推定した上限の金額(`limit`。かっこは出し方で、`current window` は今の使用枠の料金から、`history` は過去の記録から)、上限までの残りの金額(`remaining`)、使い切る確率(リセットまでに上限に達する確率。`exhaust probability`)です。料金から確率を出せない使用枠は、`remaining` が残りの使用率(%)になり、`(from usage growth)` が付きます(下の「使い切る確率」)。
-最後の行は、Claude・Codex それぞれの使い残す確率(1 − 使い切る確率)と、判断を決めた使用枠です。`guard`・`sub_tight` は歯止め(上限に達しそうな側を避ける判断)で決めた使用枠、`full` は満杯(使用率が 98% 以上)の使用枠です(下の「判断のしかた」)。読めなかったことや注記があれば、`error:`・`note:` の行が出ます。
-この例では、移譲元(Claude。下の「移譲元と移譲先」)の使い切る確率がどの使用枠でも 0.5 を超えていないので、1 週間の使用枠の使い残す確率(`leftover probability`)の高い Codex に回しています。
+最後の行は、Claude・Codex それぞれの契約で使われないまま残ると見込まれる料金(`expected leftover`)、使い残す確率(1 − 使い切る確率。かっこ内)と、判断を決めた使用枠です。`guard` は歯止め(上限に達しそうな移譲元を避ける判断)で決めた使用枠、`full` は満杯(使用率が 98% 以上)の使用枠です(下の「判断のしかた」)。読めなかったことや注記があれば、`error:`・`note:` の行が出ます。
+この例では、移譲元(Claude。下の「移譲元と移譲先」)の使い切る確率がどの使用枠でも 0.5 を超えていないので、使い残すと見込まれる料金の大きい Claude に回しています。Claude では、5 時間の使用枠は 1 週間の使用枠のリセットまでに合わせて $261 より多く使えるので、使える量を決めるのは 1 週間の使用枠の残り $261 です。
 
 ## 動作環境
 
@@ -111,16 +111,17 @@ Claude を主に使い、仕事の一部を Codex に任せる人も、その逆
 
 `now --json` の形(値は例。`windows` は使用枠ごと)：
 ```json
-{"pick": "codex", "main": "claude", "reason": "leftover", "tie": false, "guard": [], "sub_tight": [], "full": [],
- "claude_L": 0.5, "codex_L": 0.5325,
+{"pick": "codex", "main": "claude", "reason": "leftover", "tie": false, "guard": [], "full": [],
+ "claude_left_usd": 152.4, "codex_left_usd": 61.87, "claude_L": 0.5, "codex_L": 0.5325,
  "windows": {"claude-session": {"u": 24.0, "r": 1791519599, "win": 300, "scoped": false, "X": 0.0275,
                                 "limit_usd": 207.6129, "limit_src": "now", "rem_h": 2.6989, "remain_usd": 157.7858}, "...": {}},
  "errors": [], "notes": ["Claude: used the record from 10:37:12 (within 60 s; API not called)"]}
 ```
-- `reason` は次のどれかです：`full`(満杯)・`guard`(歯止め。下の「判断のしかた」の 2)・`tie`(差なし)・`leftover`(使い残す確率の比較)・`codex_unreadable`(Codex が読めない)・`claude_unreadable`(Claude が読めない)・`both_unreadable`(どちらも読めない。`tie_default` を返す)。
-- `guard` は、移譲元で使い切る確率が設定の `guard_risk`(既定 0.5)を超えたので移譲先に回した、その使用枠です。`sub_tight` は、移譲先でその確率が `guard_risk` を超えた(移譲元には超える使用枠が無い)ので移譲元に残した、その使用枠です。どちらも、判断がその段で決まったときだけ入ります。`full` は、使用率が設定の `full`(既定 98%)以上の使用枠の一覧です(判断がどの段で決まったかに関係なく、すべて入ります)。
+- `reason` は次のどれかです：`full`(満杯)・`guard`(歯止め。下の「判断のしかた」の 2)・`tie`(差なし)・`leftover`(使い残す料金の比較)・`leftover_prob`(使い残す確率の比較。料金で上限が出ない使用枠があるとき)・`codex_unreadable`(Codex が読めない)・`claude_unreadable`(Claude が読めない)・`both_unreadable`(どちらも読めない。`tie_default` を返す)。
+- `guard` は、移譲元で使い切る確率が設定の `guard_risk`(既定 0.5)を超えたので移譲先に回した、その使用枠です。判断がその段で決まったときだけ入ります。`full` は、使用率が設定の `full`(既定 98%)以上の使用枠の一覧です(判断がどの段で決まったかに関係なく、すべて入ります)。
+- `claude_left_usd`・`codex_left_usd` は Claude・Codex それぞれの契約で、使われないまま残ると見込まれる料金の期待値(USD)です(下の「判断のしかた」の 3。料金で上限が出ない使用枠がある側と、一方しか読めないときは `null`)。
 - `claude_L`・`codex_L` は Claude・Codex それぞれの使い残す確率です(一方しか読めないときは `null`)。
-- 使用枠ごとの値：`u` 使用率(%)、`r` リセットの時刻(Unix 時刻・秒)、`win` 使用枠の長さ(分)、`scoped` モデルを限った使用枠か、`X` 使い切る確率、`limit_usd` 上限の金額(USD)、`limit_src` 上限の出し方(`now` 今の使用枠の料金から/`hist` 過去の記録から)、`rem_h` リセットまでの時間、`remain_usd` 上限までの残りの金額(USD)、`basis` 使用率の増え方から X を出したときだけ `usage`、`remain_pct` そのときの上限までの残りの使用率(%)、`note` その使用枠の注記。
+- 使用枠ごとの値：`u` 使用率(%)、`r` リセットの時刻(Unix 時刻・秒)、`win` 使用枠の長さ(分。Claude は記録からの推定)、`win_known` 長さが分かっているか(`false` は下限だけ)、`scoped` モデルを限った使用枠か、`X` 使い切る確率、`limit_usd` 上限の金額(USD)、`limit_src` 上限の出し方(`now` 今の使用枠の料金から/`hist` 過去の記録から)、`rem_h` リセットまでの時間、`remain_usd` 上限までの残りの金額(USD)、`basis` 使用率の増え方から X を出したときだけ `usage`、`remain_pct` そのときの上限までの残りの使用率(%)、`note` その使用枠の注記。
 - このツールの表示(`router.py` の `now`・`sample` などの表示と `errors`・`notes`・`note` の文、インストーラ・アンインストーラ・移譲のスキルの表示)は英語です。
 
 ## 移譲のスキル
@@ -142,8 +143,8 @@ Claude を主に使い、仕事の一部を Codex に任せる人も、その逆
 
 `pick.sh` の出力の例：
 ```
-codex claude-codex-router: leftover (leftover probability Claude 0.50 / Codex 0.53)
-claude claude-codex-router: guard (leftover probability Claude 0.40 / Codex 0.50); kept on main (sub side short window): codex-5h
+claude claude-codex-router: leftover (expected leftover Claude $122 / Codex $105)
+codex claude-codex-router: guard (expected leftover Claude $40 / Codex $95); guard (main side): claude-weekly_all
 ```
 
 ### 入れ方
@@ -168,8 +169,8 @@ claude claude-codex-router: guard (leftover probability Claude 0.40 / Codex 0.50
 | キー | 既定 | 意味 |
 |---|---|---|
 | `main` | `claude` | 移譲元(`--main` で上書き) |
-| `guard_risk` | 0.5 | 移譲元のどれかの使用枠の「使い切る確率」がこれを超えたら、移譲先に回す。移譲先のどれかの使用枠でこれを超えたら(移譲元には超える使用枠が無いとき)、移譲元に残す。両方にあれば、使い残す確率の比較で決める |
-| `tie_default` | `codex` | Claude と Codex の使い残す確率がちょうど等しいとき、およびどちらも読めないときに任せる方 |
+| `guard_risk` | 0.5 | 移譲元のどれかの使用枠の「使い切る確率」がこれを超えたら、移譲先に回す(移譲先の確率は見ない) |
+| `tie_default` | `codex` | Claude と Codex の使い残す料金(料金で比べられないときは使い残す確率)がちょうど等しいとき、およびどちらも読めないときに任せる方 |
 | `full` | 98 | 使用率がこれ以上の使用枠を満杯とみなす。Claude と Codex の一方だけに満杯の使用枠があれば、もう一方に回す |
 | `claude_min_interval` | 60 | この秒数以内に読んだ Claude の記録があれば、Claude の使用率の API を呼ばずにそれを使う(0 で無効) |
 | `prices` | `{}` | 単価の上書き。会話ログに書かれたモデル名ごとに、100 万トークンあたりの USD：`in`(入力)・`out`(出力)・`cw5m`・`cw1h`(キャッシュ書き込み 5 分・1 時間)・`cr`(キャッシュ読み込み) |
@@ -224,9 +225,9 @@ claude claude-codex-router: guard (leftover probability Claude 0.40 / Codex 0.50
 
 サービスが返す使用枠を扱います。使用枠の数・長さ・上限が変わっても、そのまま扱えます。
 
-- Claude：使用率の API が返す使用枠の一覧(5 時間の `session`、7 日の `weekly_all` など)。知らない種類の使用枠は判断に使わず、注記に出します。
+- Claude：使用率の API が返す使用枠の一覧(`session`・`weekly_all` など。知らない種類も同じように扱います)。API は使用枠の長さを返さないので、長さは記録から推定します。ある期間を初めて読んだ時刻からリセットまでの時間は、その使用枠の長さ以下です。これを全期間で見て、いちばん大きいものを長さとします(5 分おきに読むので、誤差は読む間隔ほどです)。期間の始まりの前後を読んだことがまだ無い(入れた直後など)あいだは、長さは下限でしかありません(表示に `at least`)。そのあいだは、今の使用枠の料金から上限の金額を出しません(使用枠の始まりが分からないため)。手元の記録では、`session` は 299.8 分、`weekly_all` は 10079.9 分と推定されました。
   モデルを限った使用枠(例：Fable だけを数える 7 日の使用枠)は表示だけで、判断には使いません(その使用枠で作業が止まるかは、そのモデルを使っているかで決まり、このツールには分からないため)。
-- Codex：ChatGPT のサーバーが返す 2 つの使用枠(`primary`・`secondary`。長さもサーバーが返します)。
+- Codex：ChatGPT のサーバーが返すすべての使用枠(長さもサーバーが返します)。`rate_limit` の下の使用枠(今は `primary`・`secondary`)を判断に使います。それ以外の場所の使用枠(`additional_rate_limits`・`code_review_rate_limit` など)は、何に掛かる使用枠か分からないので、表示だけにします。
 
 ### 使い切る確率
 
@@ -255,17 +256,19 @@ claude claude-codex-router: guard (leftover probability Claude 0.40 / Codex 0.50
 
 ### 判断のしかた
 
-Claude と Codex の使用率をどちらも読めたときは、次の順に決めます。先の段で決まれば、後の段は見ません。一方しか読めないときは、満杯も歯止めも見ずに読めた方を、どちらも読めないときは `tie_default` を選びます(そのとき JSON の `full` は空、`claude_L`・`codex_L` は `null` です)。
+Claude と Codex の使用率をどちらも読めたときは、次の順に決めます。先の段で決まれば、後の段は見ません。一方しか読めないときは、読めた方を選びます。ただし、読めたのが移譲元で、その使い切る確率が `guard_risk` を超える使用枠があるときは、移譲先に回します(`reason` は `guard`。移譲先が上限に達していても、移譲元に戻せば作業は続くためです)。どちらも読めないときは `tie_default` を選びます(そのとき JSON の `full` は空、`claude_left_usd`・`codex_left_usd`・`claude_L`・`codex_L` は `null` です)。
 
 1. **満杯**：Claude と Codex の一方だけに、使用率が `full`(既定 98%)以上の使用枠があれば、もう一方に回します。どちらにもあるときは次の段へ進みます。
-2. **歯止め**：移譲元のどれかの使用枠で使い切る確率 X が `guard_risk`(既定 0.5)を超え、移譲先には超える使用枠が無いなら、移譲先に回します。
-   移譲元が上限に達すると、そこから任せている作業も止まるためです(移譲先が上限に達しても、移譲元に戻せば作業は続きます)。
-   逆に、移譲先のどれかの使用枠の X が `guard_risk` を超え、移譲元には超える使用枠が無いなら、移譲元に回します。
-   両方に超える使用枠があるときは、どちらに回しても使い切るおそれがあるので、歯止めでは決めずに次の段へ進みます。
-3. **使い残す確率の比較**：すべての使用枠(長さによらず)の使い残す確率を、Claude・Codex それぞれで最も小さいもの同士で比べ、大きい方に回します。
-   - 読み方：使い残す確率が 0.9 なら、これまでと同じように使うと 9 割の見込みで使い残すので、その使用枠を先に使うほど、期間の終わりに使われないまま消える使用量が減ります。0.1 なら、9 割の見込みで使い切ります。
-   - ちょうど等しければ `tie_default`(既定 codex)。X の出せる使用枠が無い方は 0.5 とみなします。
-   - 確率は、乱数で作った多数の見込みから数えるので、±0.03 程度の揺れがあります(同じ入力なら同じ値です)。まとまった料金を使った直後は、上限までの残りの金額が減るので、短い使用枠の確率が大きく上がることがあります。
+2. **歯止め**：移譲元のどれかの使用枠で使い切る確率 X が `guard_risk`(既定 0.5)を超えたら、移譲先に回します(移譲先の X は見ません)。
+   移譲元が上限に達すると、そこから任せている作業も止まるためです。移譲先が上限に達しても、移譲元に戻せば作業は続くので(移譲のスキルはそうします)、移譲先には歯止めを置きません。
+3. **使い残す料金の比較**：Claude・Codex それぞれの契約で、使われないまま残ると見込まれる料金(USD)の期待値を比べ、大きい方に回します。
+   - 契約の使用枠のうち、いちばん長いもの(長さは API が返す値)の次のリセットの時刻を T とします。使われなかった料金が消えるのはこのときです(短い使用枠のリセットで残った分は、いちばん長い使用枠に残っていて後で使えます)。
+   - T までに使える量は、使用枠ごとの「今の残りの金額 + T までに始まる期間の数 × 上限(期間が始まれば上限の全額が使えるので、T の前に始まる期間は全額)」のうち最も小さいものです(T より後にリセットされる使用枠は、今の残りだけ)。使い残す料金の期待値は、T までに使う料金の見込み S について E[max(0, 使える量 − S)] です。数えるのは、仕事を回せば使えたのに使わずに終わる分だけです。ほかの使用枠の上限のせいでどう回しても使えない分は数えません。
+   - 短い使用枠は、T までの期間の分を合わせるといちばん長い使用枠の残りより多く使えるなら、使える量を決めません(短い方を使い切り続けると長い方の上限を超えるので、短い方を使い切ることに意味が無いためです)。いちばん長い使用枠が先にリセットされるとき(週のリセットの直前など)は、それまでに短い使用枠で使える分が使える量になります。使用枠の種類は決め打ちしません。
+   - 契約ごとに T が違うので、比べるのは「それぞれの契約が、自分の次のリセットまでに残すと見込まれる料金」です。
+   - ちょうど等しければ `tie_default`(既定 codex)。
+   - 料金で上限が出ない使用枠(使用率の伸びから X を出したもの)がある側があるときは、料金で比べられないので、使い残す確率(1 − X)の比較で決めます(`reason` は `leftover_prob`、`notes` に書きます)。Claude・Codex それぞれのいちばん長い使用枠(使われなかった分が消える使用枠)の使い残す確率を比べ、大きい方に回します(同じ長さが複数あれば小さい方)。X の出せる使用枠が無い方は 0.5 とみなします。
+   - 見込みは乱数で作った多数の見込みから出すので、少し揺れます(同じ入力なら同じ値です)。
 
 ### 定期の記録(periodic sampling)
 

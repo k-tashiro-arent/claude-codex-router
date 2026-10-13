@@ -4,9 +4,11 @@
 Main side and sub side: the side used mainly is set by --main claude|codex (or main in config, default claude). The other side is the sub side.
 
 Windows: every window the API returns is handled (their number, length and limit are assumed to change).
-  Claude: each window in limits of the usage API (session = 5 hours, weekly = 7 days; unknown kinds are not used for the decision and get a note).
+  Claude: each window in limits of the usage API (every kind). The API gives no length: it is estimated from the reads (estimate_length: the largest,
+          over the periods, of the reset minus the period's first read); until some period's start has been read closely, only a lower bound.
           Model-scoped windows (windows with a scope) are shown only, not used for the decision.
-  Codex : primary and secondary of rateLimits (the API returns the length).
+  Codex : every window in the response (the API returns the length); those under rate_limit are used, the others (what they apply to is not known)
+          are shown only.
 
 Usage is counted in cost (USD): token counts in the conversation logs × per-model price.
   Prices are taken at run time from LiteLLM's price data and cached in <DIR>/data/litellm-prices.json (sample refetches it when older than 1 day;
@@ -36,15 +38,22 @@ Exhaust probability X (probability of reaching the limit before the window's nex
 
 Decision (once a stage decides, later stages are not looked at):
   1. Full: if only one side has reached the limit (full in config, default 98%) in some window, the other side. If both have, go on.
-  2. Guard: if X of any main-side window exceeds guard_risk in config (default 0.5) and no sub-side window does, the sub side.
-     When the main side reaches its limit, the side that drives the work with it stops too. If the sub side is at its limit, work continues by returning to the main side.
-     If X of any sub-side window exceeds guard_risk and no main-side window does, the main side. If both sides have such a window, go on.
-  3. Compare: for every window (of any length), the probability of not using the window up before the reset, 1 − X (leftover probability); the side whose minimum is larger.
-     If equal, tie_default in config (default codex).
+  2. Guard: if X of any main-side window exceeds guard_risk in config (default 0.5), the sub side (the sub side's X is not looked at).
+     When the main side reaches its limit, the side that drives the work with it stops too. If the sub side reaches its limit, work continues by
+     returning to the main side (the delegation skills do so), so the sub side has no guard.
+     Only one side read: that side, except that the sub side is chosen when the main side is read and over guard (the sub side's state is not needed).
+  3. Compare: the side whose contract is expected to leave more cost ($) unused although it could be used. For a side, T = the next reset of its longest
+     window (where unused cost is lost; a shorter window's leftover is still held by the longest one); what it can use until T = the least, over its
+     windows, of the remaining amount plus the whole limit for each further period of the window starting before T (a window resetting after T adds
+     nothing; a shorter window whose periods until T allow more than the longest one holds does not bind); expected leftover = E[max(0, that − S)],
+     S the forecast use until T.
+     If a side has a window without a limit in cost (X from usage growth), the cost cannot be compared: the leftover probability 1 − X of each side's
+     longest window is compared instead (a side without any X counts as 0.5), reason leftover_prob. If equal, tie_default in config (default codex).
 
 Usage records (each environment accumulates its own):
   <DIR>/data/usage.jsonl. 1 line = 1 read of 1 window {"ts", "side", "id": window kind, "win": window length (min), "u": usage, "r": reset time,
-  "scoped": whether the window is model-scoped, "src"}. For old lines without id, it is derived from the length (Claude 300→session, 10080→weekly_all; Codex by the length).
+  "scoped": whether the window is model-scoped, "src"}. Lines without id: Codex by the length; Claude (imported or from earlier versions) joined to
+  the kind with the same reset times.
   DIR is the environment variable CLAUDE_CODEX_ROUTER_DIR (default ~/.claude/codex-router).
   How they are read (neither calls a model, so the windows are not used up):
     Claude: GET https://api.anthropic.com/api/oauth/usage (same as /usage in Claude Code; not publicly documented).
@@ -72,10 +81,9 @@ usage:
   router.py now [--json] [--main claude|codex]  decide now (reads both, also records). exit 0=both read 1=one side 2=neither
   router.py sample      read both and record; add cost rows from the conversation logs (the timer calls this every 5 min)
 
-now --json fields: pick, main, reason (full|guard|tie|leftover|codex_unreadable|claude_unreadable|both_unreadable), tie,
-  guard (main-side windows over guard_risk, when they sent the pick to the sub side),
-  sub_tight (sub-side windows over guard_risk, when they kept the pick on main), full (all windows at full),
-  claude_L, codex_L, windows, errors, notes. Data and settings: $CLAUDE_CODEX_ROUTER_DIR (default ~/.claude/codex-router)."""
+now --json fields: pick, main, reason (full|guard|tie|leftover|leftover_prob|codex_unreadable|claude_unreadable|both_unreadable), tie,
+  guard (main-side windows over guard_risk, when they sent the pick to the sub side), full (all windows at full),
+  claude_left_usd, codex_left_usd (expected leftover $ of each contract), claude_L, codex_L (leftover probability), windows, errors, notes. Data and settings: $CLAUDE_CODEX_ROUTER_DIR (default ~/.claude/codex-router)."""
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_DEFAULTS = os.path.join(os.path.dirname(HERE), 'defaults')   # when run directly from the repository
@@ -122,7 +130,7 @@ except (TypeError, ValueError):
 RECENT_MAX_AGE = 600   # max age (s) of the record used instead on 429. Records are every 5 minutes, so this is 2 records' worth
 TIE_DEFAULT = CONFIG['tie_default'] if CONFIG['tie_default'] in ('claude', 'codex') else 'codex'
 LIMIT_NOW_U = 10.0   # if usage is at least this, the limit is estimated from the current window
-CLAUDE_KIND_WIN = {'session': 300, 'weekly': 10080}   # Claude window group → length (min)
+LEN_TIGHT = 0.02   # a window's length counts as known when some period's start is bracketed by two reads closer than this share of the length
 
 
 # ---- prices (LiteLLM) ----
@@ -319,14 +327,16 @@ def _token_pace_rows(path, start, name):
             continue
         if not isinstance(d, dict):
             continue
-        if name == 'pace.jsonl':
-            vals = [('claude', 300, d.get('h5'), d.get('h5r')), ('claude', 10080, d.get('d7'), d.get('d7r'))]
-        else:
-            vals = [('codex', d.get('w'), d.get('u'), d.get('r')), ('codex', d.get('w2'), d.get('u2'), d.get('r2'))]
-        for side, win, u, r in vals:
+        if name == 'pace.jsonl':   # Claude: every field k with a reset field k + 'r'; which window it is, is found from the reset times (load_series)
+            vals = [('claude', k, None, d.get(k), d.get(k + 'r')) for k in d if k != 'ts' and k + 'r' in d]
+        else:                      # Codex: the length Codex reported
+            vals = [('codex', None, d.get('w'), d.get('u'), d.get('r')), ('codex', None, d.get('w2'), d.get('u2'), d.get('r2'))]
+        for side, key, win, u, r in vals:
             try:
-                if win and r and u is not None:
-                    out.append({'ts': int(d['ts']), 'side': side, 'win': int(win), 'u': float(u), 'r': int(r), 'src': 'token-pace'})
+                if (key or win) and r and u is not None:
+                    row = {'ts': int(d['ts']), 'side': side, 'u': float(u), 'r': int(r), 'src': 'token-pace'}
+                    row.update({'tp': key} if key else {'win': int(win)})
+                    out.append(row)
             except (TypeError, ValueError, KeyError):
                 continue
     return out, start + end
@@ -397,10 +407,10 @@ def sync_costs(full=False):
         usage += rows
         tp[name] = {'size': size, 'mtime': mtime, 'pos': pos}
     if usage and reread:
-        have = {(x['ts'], x['side'], row_id(x)) for x in read_log()}
+        have = {(x['ts'], x['side'], x.get('r'), x.get('u')) for x in read_log()}   # by values, not by kind (imported rows may carry other kinds)
         uniq = []
         for x in usage:
-            k = (x['ts'], x['side'], row_id(x))
+            k = (x['ts'], x['side'], x.get('r'), x.get('u'))
             if k not in have:
                 have.add(k)
                 uniq.append(x)
@@ -707,12 +717,32 @@ def clean_points(pts):
 
 
 def row_id(x):
-    """Window kind of a record row. For old rows without id, from the length (Claude 300→session, 10080→weekly_all; Codex by the length)."""
+    """Window kind of a record row: the id the API gave. Rows without one: Codex by the length the API gave; Claude rows imported from claude-token-pace
+    or written by earlier versions get a provisional kind ('legacy:...'), which load_series joins to the API's kind with the same reset times."""
     if x.get('id'):
         return x['id']
     if x.get('side') == 'claude':
-        return {300: 'session', 10080: 'weekly_all'}.get(x.get('win'), f'{x.get("win")}m')
+        return f'legacy:{x["tp"]}' if x.get('tp') else f'legacy:{x.get("win")}'
     return win_label(x.get('win'))
+
+
+def _join_legacy(reads):
+    """{kind: [(ts, r, ...)]} → the same with each provisional kind ('legacy:...') joined to the API's kind whose reset times match most of its reads
+    (within 1 hour). A provisional kind matching none stays as it is."""
+    resets = {k: sorted(v[1] for v in rs if v[1]) for k, rs in reads.items() if not k.startswith('legacy:')}
+    out = {k: list(v) for k, v in reads.items() if not k.startswith('legacy:')}
+    for k, rs in reads.items():
+        if not k.startswith('legacy:'):
+            continue
+        hits = {}
+        for v in rs:
+            for kk, rr in resets.items():
+                i = bisect.bisect_left(rr, (v[1] or 0) - 3600)
+                if v[1] and i < len(rr) and abs(rr[i] - v[1]) < 3600:
+                    hits[kk] = hits.get(kk, 0) + 1
+        to = max(hits, key=hits.get) if hits else k
+        out.setdefault(to, []).extend(rs)
+    return out
 
 
 def win_label(win_min):
@@ -726,8 +756,8 @@ def win_label(win_min):
 class Series:
     """Holds the observations [(ts, u, r)] of one window, split into periods (one per reset)."""
 
-    def __init__(self, side, wid, win_min, samples, scoped=False):
-        self.side, self.id, self.win_min, self.win, self.scoped = side, wid, win_min, win_min * 60, scoped
+    def __init__(self, side, wid, win_min, samples, scoped=False, known=True):
+        self.side, self.id, self.win_min, self.win, self.scoped, self.known = side, wid, win_min, win_min * 60, scoped, known
         self.name = f'{side}-{wid}'
         # drop values (t >= r) from old sessions that keep reporting a period already reset. Periods are split by reset time (differences within 1 hour count as the same)
         s = sorted((r, t, u) for t, u, r in samples if r and t < r)
@@ -773,16 +803,50 @@ class Series:
         return us[bisect.bisect_right(xs, t) - 1]
 
 
+def estimate_length(reads):
+    """Length (min) of a window from its reads [(ts, r)] (r None when no period was running): a period started at or before its first read, so
+    r − (first read of the period) is at most the length; the largest over the periods. Returns (length, known): known when some period's start is
+    bracketed by that read and the read before it (closer than LEN_TIGHT of the length). Not known: only a lower bound. (None, False) without periods.
+    The length is not taken from the window's kind (the usage API does not give it, and it may change)."""
+    lows, tight, cur, prev = [], [], None, None
+    for ts, r in sorted(reads):
+        if r and ts < r and not (cur and abs(r - cur) < 3600):
+            lo = (r - ts) / 60
+            lows.append(lo)
+            if prev is not None and (ts - prev) / 60 <= LEN_TIGHT * lo:
+                tight.append(lo)
+            cur = r
+        prev = ts
+    if not lows:
+        return None, False
+    est = max(lows)
+    return est, any(lo >= est * (1 - LEN_TIGHT) for lo in tight)
+
+
 def load_series(side, rows=None, until=None):
-    """{window kind: Series}."""
-    by, meta = {}, {}
+    """{window kind: Series}. Length: what the API gave (Codex; the latest), else estimate_length from the reads (Claude)."""
+    by, reads, meta = {}, {}, {}
     for x in rows if rows is not None else read_log():
-        if x.get('side') != side or not x.get('r') or not x.get('win') or (until is not None and x['ts'] > until):
+        if x.get('side') != side or (until is not None and x['ts'] > until):
             continue
         k = row_id(x)
-        by.setdefault(k, []).append((x['ts'], float(x['u']), x['r']))
-        meta[k] = (int(x['win']), bool(x.get('scoped')))
-    return {k: Series(side, k, meta[k][0], s, meta[k][1]) for k, s in by.items()}
+        reads.setdefault(k, []).append((x['ts'], x.get('r')))
+        if side == 'codex' and x.get('win'):
+            meta[k] = int(x['win'])
+        if x.get('r'):
+            by.setdefault(k, []).append((x['ts'], float(x['u']), x['r'], bool(x.get('scoped'))))
+    if side == 'claude':
+        joined = _join_legacy({k: [(ts, r, i) for i, (ts, r) in enumerate(v)] for k, v in reads.items()})
+        reads = {k: [(ts, r) for ts, r, _ in v] for k, v in joined.items()}
+        by = _join_legacy({k: [(v[0], v[2], v) for v in smp] for k, smp in by.items()})
+        by = {k: [v[2] for v in smp] for k, smp in by.items()}
+    out = {}
+    for k, smp in by.items():
+        smp.sort()
+        win, known = (meta[k], True) if k in meta else estimate_length(reads[k])
+        if win:
+            out[k] = Series(side, k, win, [v[:3] for v in smp], smp[-1][3], known)
+    return out
 
 
 def record(rows, src='live'):
@@ -795,8 +859,8 @@ def record(rows, src='live'):
     with open(USAGE_LOG, 'a') as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         for x in rows:
-            f.write(json.dumps({'ts': int(x.get('ts') or time.time()), 'side': x['side'], 'id': row_id(x), 'win': x['win'], 'u': x['u'],
-                                'r': x['r'], **({'scoped': True} if x.get('scoped') else {}), 'src': x.get('src', src)}) + '\n')
+            f.write(json.dumps({'ts': int(x.get('ts') or time.time()), 'side': x['side'], **{k: x[k] for k in ('id', 'tp', 'win') if x.get(k)},
+                                'u': x['u'], 'r': x['r'], **({'scoped': True} if x.get('scoped') else {}), 'src': x.get('src', src)}) + '\n')
 
 
 def read_log():
@@ -837,13 +901,14 @@ def limit_hist(ser, cs_, t):
     return 100.0 * c / du if du >= 20 else None
 
 
-def limit_usd(ser, cs_, u, t, r, win_min):
+def limit_usd(ser, cs_, u, t, r, win_min, known=True):
     """Limit ($) and how it was obtained. In order: from the current window (u ≥ LIMIT_NOW_U), from history, from the current window (when history is not enough).
     When the cost records start after the window start, history is used first; if unavailable, the current window with the cost before the records taken as 0
-    (the same assumption as the cost covering only this computer's conversation logs)."""
+    (the same assumption as the cost covering only this computer's conversation logs). Not from the current window while the length is only a lower bound
+    (known False: the window start is not known)."""
     start = r - win_min * 60
     c = cs_.cost_between(start, t)
-    now = 100.0 * c / u if u > 0 and c > 0 else None   # if the cost is 0 (only use elsewhere), it cannot be estimated from the current window
+    now = 100.0 * c / u if known and u > 0 and c > 0 else None   # if the cost is 0 (only use elsewhere), it cannot be estimated from the current window
     if now is not None and u >= LIMIT_NOW_U and start >= cs_.T0:
         return now, 'now'
     h = limit_hist(ser, cs_, t) if ser else None
@@ -852,11 +917,34 @@ def limit_usd(ser, cs_, u, t, r, win_min):
     return (now, 'now') if now else (None, None)
 
 
+def leftover_horizon(wins):
+    """The time T at which the contract's unused cost is lost: the next reset of its longest window (the earliest of them if several are as long).
+    A shorter window's leftover at its reset is not lost: the longest window still holds it (using every shorter period fully would exceed the longer one).
+    wins: [(remaining $, limit $, reset, length min)]."""
+    longest = max(win for _, _, _, win in wins)
+    return min(r for _, _, r, win in wins if win == longest)
+
+
+def contract_leftover(wins, samples, t):
+    """Expected cost ($) the side's contract leaves unused although it could be used: T = leftover_horizon(wins); what can be used until T is the least,
+    over the windows, of the remaining amount plus the whole limit for each further period of the window that starts before T (a started period makes
+    its whole limit usable; a window resetting after T adds nothing); the expected leftover is E[max(0, that − S)], S the use from t until T (samples).
+    A shorter window does not bind when its periods until T allow more than the longest window holds; one that allows less does (then the part of the
+    longest window's amount beyond it cannot be used whatever is sent, and is not counted). wins: [(remaining $, limit $, reset, length min)]."""
+    if not wins or not samples:
+        return None
+    T = leftover_horizon(wins)
+    cap = min(m + L * max(0, math.ceil((T - r) / (win * 60) - 1e-9)) for m, L, r, win in wins)
+    return sum(max(0.0, cap - v) for v in samples) / len(samples)
+
+
 def window_states(rows, t, log=None, n=N_SAMP):
-    """From the current reads rows, the state of each window {name: {...}} (per side) and notes."""
+    """From the current reads rows, the state of each window {name: {...}} (per side), notes, and the expected leftover ($) of each side's contract
+    (contract_leftover; None when some window of the side has no limit in cost or its forecast is missing)."""
     log = read_log() if log is None else log
     notes = []
     out = {'claude': {}, 'codex': {}}
+    left = {'claude': None, 'codex': None}
     for side in ('claude', 'codex'):
         rs = [x for x in rows if x['side'] == side]
         if not rs:
@@ -867,23 +955,39 @@ def window_states(rows, t, log=None, n=N_SAMP):
         cs_ = CostSeries(ev, t) if ev else None
         if cs_ is None:
             notes.append(f'{side}: no cost records on this machine; exhaust probability from usage growth')
-        sers = load_series(side, log)
+        cur = [{**x, 'ts': x.get('ts') or int(t)} for x in rs if not x.get('cached')]   # the current reads count for the length too
+        sers = load_series(side, log + cur)
         held = held_back(sers.values(), t)
         need, need_u = [], []
         for x in rs:
             name = f'{side}-{row_id(x)}'
-            win, u = int(x['win']), float(x['u'])
-            r = x['r'] if x.get('r') and x['r'] > t else t + win * 60
-            st = {'u': u, 'r': r, 'win': win, 'scoped': bool(x.get('scoped')), 'X': None, 'limit_usd': None, 'limit_src': None,
+            ser = sers.get(row_id(x))
+            if side == 'codex' and x.get('win'):
+                win, known = int(x['win']), True                  # the length the API gave (Codex; Claude rows of earlier versions held a fixed length)
+            elif ser:
+                win, known = ser.win_min, ser.known               # estimated from the reads (Claude: the API gives no length)
+            else:
+                out[side][name] = {'u': float(x['u']), 'r': x.get('r'), 'win': None, 'scoped': bool(x.get('scoped')), 'X': None, 'limit_usd': None,
+                                   'limit_src': None, 'rem_h': None, 'note': 'length unknown (no period has been read yet), not used'}
+                continue
+            u = float(x['u'])
+            r, passed = x.get('r'), False
+            if r and r <= t:   # the window has reset since the read (a record used instead of a read): a new period, counted from 0
+                r, u, passed = r + (int((t - r) // (win * 60)) + 1) * win * 60, 0.0, True
+            elif not r:
+                r = t + win * 60
+            st = {'u': u, 'r': r, 'win': win, 'win_known': known, 'scoped': bool(x.get('scoped')), 'X': None, 'limit_usd': None, 'limit_src': None,
                   'rem_h': (r - t) / 3600}
             out[side][name] = st
+            if passed:
+                notes.append(f'{name}: reset after the read used ({time.strftime("%H:%M:%S", time.localtime(x["ts"]))}); usage counted from 0')
             if st['scoped']:
                 st['note'] = 'model-scoped window (shown only, not used for the decision)'
                 continue
             if cs_ is None:
                 need_u.append((st, x))
                 continue
-            L, src = limit_usd(sers.get(row_id(x)), cs_, u, t, r, win)
+            L, src = limit_usd(ser, cs_, u, t, r, win, known)
             st['limit_usd'], st['limit_src'] = (L, src) if L else (None, None)
             if not L:
                 st['note'] = 'limit unknown in cost (no cost or no usage in this window yet, and no usage history to estimate from); exhaust probability from usage growth'
@@ -900,44 +1004,68 @@ def window_states(rows, t, log=None, n=N_SAMP):
                     st['note'] = 'cost records too short for an exhaust probability'
                     continue
                 st['X'] = sum(1 for v in s if v >= m) / len(s)
+            if not need_u and all(st['X'] is not None for st, _, _ in need):
+                wins = [(m, st['limit_usd'], st['r'], st['win']) for st, _, m in need]
+                left[side] = contract_leftover(wins, smp[leftover_horizon(wins) - t], t)
         # windows with no cost to estimate from: the same forecast on the window's own usage growth (limit 100%). The current read is included even if not yet recorded
         for st, x in need_u:
-            ser = load_series(side, log + [{**x, 'ts': x.get('ts') or int(t), 'r': st['r']}]).get(row_id(x))
+            ser = load_series(side, log + [{**x, 'ts': x.get('ts') or int(t), 'r': st['r'], 'u': st['u'], 'win': st['win'] if side == 'codex' else None}]).get(row_id(x))
             ue = [(min(a, t - 1), v) for a, v in usage_events(ser, t)]      # growth seen at the read now happened before now
             s = forecast(unheld(ue, held), t, [st['r'] - t], n=n)[0]
             st['basis'], st['remain_pct'] = 'usage', 100.0 - st['u']
             if s:
                 st['X'] = sum(1 for v in s if v >= st['remain_pct']) / len(s)
-    return out, notes
+    return out, notes, left
 
 
-def decide_states(states, main=MAIN, guard=GUARD_RISK, default=TIE_DEFAULT):
-    """states: {side: {window name: state}}. Returns (chosen side, reasons). Model-scoped windows are not used. Windows without X are not used for the guard or the comparison."""
+def decide_states(states, main=MAIN, guard=GUARD_RISK, default=TIE_DEFAULT, left_usd=None):
+    """states: {side: {window name: state}}; left_usd: {side: expected leftover $ of the contract or None} (window_states). Returns (chosen side, reasons).
+    Model-scoped windows are not used. Windows without X are not used for the guard or the probability comparison.
+    The comparison is by the expected leftover $ (stage 'leftover'); only when a side has none (no limit in cost), by the leftover probability 1 − X of
+    each side's longest window (stage 'leftover_prob')."""
+    left_usd = left_usd or {}
     sub = 'codex' if main == 'claude' else 'claude'
     use = {s: {k: v for k, v in states.get(s, {}).items() if not v.get('scoped')} for s in ('claude', 'codex')}
 
     def leftover(d):
-        v = [1 - x['X'] for x in d.values() if x['X'] is not None]
-        return min(v) if v else 0.5
+        # the window whose unused amount is lost: the longest (a shorter window's leftover is still held by it); the least if several are as long
+        v = [x for x in d.values() if x['X'] is not None]
+        if not v:
+            return 0.5
+        longest = max(x['win'] for x in v)   # the length the API gave, or estimated from the reads
+        return min(1 - x['X'] for x in v if x['win'] == longest)
     full = {s: [k for k, v in use[s].items() if v['u'] >= FULL] for s in use}
     over = [k for k, v in use[main].items() if v['X'] is not None and v['X'] > guard]
-    tight = [k for k, v in use[sub].items() if v['X'] is not None and v['X'] > guard]
     L = {s: leftover(use[s]) for s in use}
-    # guard and sub_tight list windows only when the decision was made at that stage. full always lists every full window
-    why = {'main': main, 'claude_L': L['claude'], 'codex_L': L['codex'], 'guard': [], 'sub_tight': [],
+    # guard lists windows only when the decision was made at that stage. full always lists every full window
+    why = {'main': main, 'claude_L': L['claude'], 'codex_L': L['codex'], 'guard': [],
+           'claude_left_usd': left_usd.get('claude'), 'codex_left_usd': left_usd.get('codex'),
            'full': full['claude'] + full['codex'], 'tie': False, 'stage': ''}
     if full[sub] and not full[main]:
         return main, dict(why, stage='full')
     if full[main] and not full[sub]:
         return sub, dict(why, stage='full')
-    # when both sides have a window over guard, the guard does not decide (sending to either side may use it up); go on to the comparison
-    if over and not tight:
+    if over:
         return sub, dict(why, stage='guard', guard=over)
-    if tight and not over:
-        return main, dict(why, stage='guard', sub_tight=tight)
-    if L['claude'] == L['codex']:
+    if why['claude_left_usd'] is not None and why['codex_left_usd'] is not None:
+        a, b, stage = why['claude_left_usd'], why['codex_left_usd'], 'leftover'
+    else:   # a side has no limit in cost: the leftover cannot be compared in cost; compare the leftover probability instead
+        a, b, stage = L['claude'], L['codex'], 'leftover_prob'
+    if a == b:
         return default, dict(why, stage='tie', tie=True)
-    return ('claude' if L['claude'] > L['codex'] else 'codex'), dict(why, stage='leftover')
+    return ('claude' if a > b else 'codex'), dict(why, stage=stage)
+
+
+def decide_one_side(states, main=MAIN, guard=GUARD_RISK):
+    """Only one side was read. Returns (chosen side, reason, guard windows). The readable side, except: when it is the main side and some window of it is
+    over guard, the sub side (if the sub side is at its limit, work returns to the main side, so its unknown state does not stop the work)."""
+    side = 'claude' if states.get('claude') else 'codex'
+    other = 'codex' if side == 'claude' else 'claude'
+    if side == main:
+        over = [k for k, v in states[side].items() if not v.get('scoped') and v['X'] is not None and v['X'] > guard]
+        if over:
+            return other, 'guard', over
+    return side, f'{other}_unreadable', []
 
 
 # ---- read the current values directly (neither calls a model) ----
@@ -960,29 +1088,24 @@ class RateLimited(RuntimeError):
 
 
 def parse_claude(d, notes=None):
-    """Usage API response → [{side, id, win, u, r, scoped}]. The limits array if present, else five_hour and seven_day."""
+    """Usage API response → [{side, id, u, r, scoped}]. The limits array if present, else every top-level object with utilization (older responses;
+    the kind is its key). Every kind is taken; the API gives no length, so it is estimated from the reads (estimate_length), not from the kind."""
     def ts(s):
         return int(datetime.datetime.fromisoformat(s.replace('Z', '+00:00')).timestamp()) if s else None
     out = []
     for w in d.get('limits') or []:
         if not isinstance(w, dict) or w.get('percent') is None:
             continue
-        win = CLAUDE_KIND_WIN.get(w.get('group'))
         scope = w.get('scope') or None
         wid = w.get('kind') or w.get('group') or '?'
         if scope:
             m = (scope.get('model') or {}) if isinstance(scope, dict) else {}
             wid += ':' + str(m.get('display_name') or m.get('id') or (scope.get('surface') if isinstance(scope, dict) else '') or 'scope')
-        if not win:
-            if notes is not None:
-                notes.append(f'Claude: unknown window kind {wid} (group={w.get("group")}), not used')
-            continue
-        out.append({'side': 'claude', 'id': wid, 'win': win, 'u': float(w['percent']), 'r': ts(w.get('resets_at')), 'scoped': bool(scope)})
+        out.append({'side': 'claude', 'id': wid, 'u': float(w['percent']), 'r': ts(w.get('resets_at')), 'scoped': bool(scope)})
     if not out:
-        for key, wid, win in (('five_hour', 'session', 300), ('seven_day', 'weekly_all', 10080)):
-            w = d.get(key)
-            if w and w.get('utilization') is not None:
-                out.append({'side': 'claude', 'id': wid, 'win': win, 'u': float(w['utilization']), 'r': ts(w.get('resets_at')), 'scoped': False})
+        for key, w in d.items():
+            if isinstance(w, dict) and w.get('utilization') is not None:
+                out.append({'side': 'claude', 'id': key, 'u': float(w['utilization']), 'r': ts(w.get('resets_at')), 'scoped': False})
     return out
 
 
@@ -1012,20 +1135,35 @@ def read_claude(t, notes=None):
     return out
 
 
+def _codex_windows(v, path=()):
+    """Every object with used_percent and limit_window_seconds under v, with its path of keys (any number of windows)."""
+    if isinstance(v, dict):
+        if v.get('used_percent') is not None and v.get('limit_window_seconds'):
+            yield path, v
+            return
+        for k, x in v.items():
+            yield from _codex_windows(x, path + (str(k),))
+    elif isinstance(v, list):
+        for i, x in enumerate(v):
+            yield from _codex_windows(x, path + (str(i),))
+
+
 def parse_codex(d):
-    """ChatGPT usage response (/backend-api/wham/usage) → [{side, id, win, u, r}] (window kinds are named by their length).
-    primary_window and secondary_window of rate_limit (the usage windows of the plan's agent features, including Codex)."""
-    out = []
-    rl = (d or {}).get('rate_limit') or {}
-    for k in ('primary_window', 'secondary_window'):
-        w = rl.get(k)
-        if not w or w.get('used_percent') is None or not w.get('limit_window_seconds'):
-            continue
+    """ChatGPT usage response (/backend-api/wham/usage) → [{side, id, win, u, r, scoped}]. Every window in the response (any number; the API gives the
+    length). Windows under rate_limit (the plan's agent features, including Codex) are named by their length and used; windows elsewhere
+    (additional_rate_limits, code_review_rate_limit, ...: what they apply to is not known) are shown only (scoped), named by their place."""
+    out, seen = [], set()
+    for path, w in _codex_windows(d or {}):
         r = w.get('reset_at') or (time.time() + w['reset_after_seconds'] if w.get('reset_after_seconds') is not None else None)
         if not r:
             continue
         win = int(w['limit_window_seconds']) // 60
-        out.append({'side': 'codex', 'id': win_label(win), 'win': win, 'u': float(w['used_percent']), 'r': int(r)})
+        main = bool(path) and path[0] == 'rate_limit'
+        wid = win_label(win) if main else '.'.join(path) + ':' + win_label(win)
+        if wid in seen:
+            wid += ':' + '.'.join(path)
+        seen.add(wid)
+        out.append({'side': 'codex', 'id': wid, 'win': win, 'u': float(w['used_percent']), 'r': int(r), **({} if main else {'scoped': True})})
     return out
 
 
@@ -1074,7 +1212,7 @@ def read_codex(t, timeout=15, notes=None):
 
 def recent_rows(side, t, max_age=RECENT_MAX_AGE):
     """The latest read of side in the records (within max_age seconds of t). [] if there is none."""
-    rows = [x for x in read_log() if x.get('side') == side and x.get('win') and x.get('src') == 'live' and t - max_age <= x['ts'] <= t]
+    rows = [x for x in read_log() if x.get('side') == side and x.get('src') == 'live' and t - max_age <= x['ts'] <= t]
     if not rows:
         return []
     last = max(x['ts'] for x in rows)
@@ -1140,26 +1278,28 @@ def decide_now(t, main=MAIN):
         sync_costs(full=not os.path.exists(COST_STATE))   # if there are no cost records yet (before sample), read all the conversation logs
     except Exception as e:   # noqa: BLE001 — decide even if the cost records could not be added
         notes.append(f'could not add cost records: {e}')
-    states, n2 = window_states(rows, t)
+    states, n2, left = window_states(rows, t)
     notes += n2
     if _price_src and _price_src.startswith('fetch failed'):
         notes.append(f'prices: {_price_src}')
-    res = {'pick': None, 'main': main, 'reason': '', 'tie': False, 'guard': [], 'sub_tight': [], 'full': [], 'claude_L': None, 'codex_L': None,
+    res = {'pick': None, 'main': main, 'reason': '', 'tie': False, 'guard': [], 'full': [], 'claude_left_usd': None, 'codex_left_usd': None,
+           'claude_L': None, 'codex_L': None,
            'windows': {}, 'errors': errs, 'notes': notes}
     for side in states:
         for k, v in states[side].items():
             res['windows'][k] = {kk: (round(vv, 4) if isinstance(vv, float) else vv) for kk, vv in v.items()}
     if states['claude'] and states['codex']:
-        pick, why = decide_states(states, main)
-        res.update(pick=pick, tie=why['tie'], guard=why['guard'], sub_tight=why['sub_tight'], full=why['full'], claude_L=round(why['claude_L'], 4),
-                   codex_L=round(why['codex_L'], 4),
-                   reason=why['stage'])
+        pick, why = decide_states(states, main, left_usd=left)
+        res.update(pick=pick, tie=why['tie'], guard=why['guard'], full=why['full'], claude_L=round(why['claude_L'], 4),
+                   codex_L=round(why['codex_L'], 4), reason=why['stage'],
+                   **{f'{s}_left_usd': (round(why[f'{s}_left_usd'], 2) if why[f'{s}_left_usd'] is not None else None) for s in ('claude', 'codex')})
+        miss = [s for s in ('claude', 'codex') if why[f'{s}_left_usd'] is None]
+        if miss:
+            notes.append(f'expected leftover in cost unknown for {" and ".join(miss)} (a window without a limit in cost); the comparison uses the leftover probability')
         return res, 0
-    if states['claude']:
-        res.update(pick='claude', reason='codex_unreadable')
-        return res, 1
-    if states['codex']:
-        res.update(pick='codex', reason='claude_unreadable')
+    if states['claude'] or states['codex']:
+        pick, reason, over = decide_one_side(states, main)
+        res.update(pick=pick, reason=reason, guard=over)
         return res, 1
     res.update(pick=TIE_DEFAULT, reason='both_unreadable')
     return res, 2
@@ -1183,10 +1323,17 @@ def print_human(res):
             extra += f'  remaining ${v["remain_usd"]:,.0f}, exhaust probability {v["X"]:.2f}'
         if v.get('note'):
             extra += f'  {v["note"]}'
-        print(f'  {k} ({win_label(v["win"])}): used {v["u"]:.0f}%  resets {f(v["r"])} (in {v["rem_h"]:.1f} h){extra}')
+        if v.get('win') is None:
+            print(f'  {k}: used {v["u"]:.0f}%  {v.get("note", "")}')
+            continue
+        lab = win_label(v['win']) + ('' if v.get('win_known', True) else ', at least')
+        print(f'  {k} ({lab}): used {v["u"]:.0f}%  resets {f(v["r"])} (in {v["rem_h"]:.1f} h){extra}')
     if res['claude_L'] is not None:
-        print(f'  leftover probability Claude {res["claude_L"]:.2f} / Codex {res["codex_L"]:.2f}  guard {res["guard"] or "none"}'
-              f'  sub_tight {res["sub_tight"] or "none"}  full {res["full"] or "none"}')
+        def usd(v):
+            return f'${v:,.0f}' if v is not None else 'unknown'
+        print(f'  expected leftover Claude {usd(res["claude_left_usd"])} / Codex {usd(res["codex_left_usd"])}'
+              f'  (leftover probability Claude {res["claude_L"]:.2f} / Codex {res["codex_L"]:.2f})  guard {res["guard"] or "none"}'
+              f'  full {res["full"] or "none"}')
 
 
 def _arg(name):

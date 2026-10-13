@@ -146,11 +146,15 @@ d = json.loads(sys.argv[1])
 w = d['windows']
 assert d['pick'] in ('claude', 'codex') and d['main'] == 'claude', d
 assert set(w) == {'claude-session', 'claude-weekly_all', 'claude-weekly_scoped:Fable', 'codex-7d'}, w.keys()
-assert w['codex-7d']['u'] == 30 and w['claude-weekly_all']['u'] == 20 and w['claude-session']['win'] == 300
+assert w['codex-7d']['u'] == 30 and w['claude-weekly_all']['u'] == 20 and w['codex-7d']['win'] == 10080
+# Claude's API gives no length: on the first read it is only a lower bound (until the reset), estimated from the reads
+assert w['claude-session']['win_known'] is False and w['claude-session']['win'] <= 300, w['claude-session']
 assert w['claude-weekly_scoped:Fable']['scoped'] and not w['claude-weekly_all']['scoped']
 # there are conversation logs, but the cost in the current windows is still 0 (no limit in cost): X comes from usage growth
-assert all(v['X'] is not None and v['basis'] == 'usage' for k, v in w.items() if not v['scoped']), w
-assert 0 <= d['claude_L'] <= 1 and 0 <= d['codex_L'] <= 1 and not d['errors'] and d['sub_tight'] == [] and d['full'] == []
+assert all(v['basis'] == 'usage' for k, v in w.items() if not v['scoped']) and w['codex-7d']['X'] is not None, w
+assert 0 <= d['claude_L'] <= 1 and 0 <= d['codex_L'] <= 1 and not d['errors'] and 'sub_tight' not in d and d['full'] == []
+# no limit in cost, so the expected leftover in cost is unknown and the comparison uses the leftover probability
+assert d['claude_left_usd'] is None and d['codex_left_usd'] is None and d['reason'] in ('leftover_prob', 'tie', 'guard'), d
 assert 'limit unknown in cost' in w['codex-7d']['note'], w['codex-7d']
 EOF
 [[ "$(wc -l < "$DIR/data/usage.jsonl")" -eq 4 ]] || fail "the records are not 4 lines"
@@ -205,7 +209,7 @@ pass "429: no retry, decided from the recent record"
 # 6b) with a recent record, Claude's API is not called (borrowed values are not added to the records)
 echo '{"guard_risk": 0.7, "claude_min_interval": 60}' > "$DIR/config.json"
 r7=$(( $(date +%s) + 4 * 86400 ))
-printf '{"ts": %s, "side": "claude", "win": 10080, "u": 33.0, "r": %s, "src": "live"}\n' "$(date +%s)" "$r7" >> "$DIR/data/usage.jsonl"
+printf '{"ts": %s, "side": "claude", "id": "weekly_all", "u": 33.0, "r": %s, "src": "live"}\n' "$(date +%s)" "$r7" >> "$DIR/data/usage.jsonl"
 : > "$work/hits"
 n0=$(wc -l < "$DIR/data/usage.jsonl")
 set +e

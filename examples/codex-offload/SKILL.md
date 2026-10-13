@@ -19,7 +19,7 @@ The scope is **all of reading, running and editing**.
 ~/.claude/skills/codex-offload/pick.sh --main claude
 ```
 - The output is one line, "`<codex|claude> <reason>`". Hand off to the side named by the first word.
-  - If claude-codex-router (`~/.claude/codex-router/bin/router.py`, location `CLAUDE_CODEX_ROUTER_DIR`) is installed, follow its decision (for both usage windows, the leftover probability before the reset, and the guard).
+  - If claude-codex-router (`~/.claude/codex-router/bin/router.py`, location `CLAUDE_CODEX_ROUTER_DIR`) is installed, follow its decision (for both contracts, the cost expected to be left unused before the reset, and the guard).
   - When it is not installed, did not answer, or its answer is unreadable: `codex` (Codex first).
 - When delegating several tasks in parallel, call it once for each (every call reads the current usage windows; it takes a few seconds).
 - **codex** → run.sh as in "How to call it" below.

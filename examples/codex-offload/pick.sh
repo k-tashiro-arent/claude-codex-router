@@ -38,9 +38,11 @@ p = d.get("pick")
 if p not in ("claude", "codex"):
     sys.exit(1)
 why = d.get("reason") or ""
-if d.get("claude_L") is not None:
+if d.get("claude_left_usd") is not None and d.get("codex_left_usd") is not None:
+    why += " (expected leftover Claude $%.0f / Codex $%.0f)" % (d["claude_left_usd"], d["codex_left_usd"])
+elif d.get("claude_L") is not None:
     why += " (leftover probability Claude %.2f / Codex %.2f)" % (d["claude_L"], d["codex_L"])
-for key, label in (("full", "full"), ("guard", "guard (main side)"), ("sub_tight", "kept on main (sub side)")):
+for key, label in (("full", "full"), ("guard", "guard (main side)")):
     if d.get(key):
         why += "; %s: %s" % (label, ", ".join(d[key]))
 if d.get("errors"):
