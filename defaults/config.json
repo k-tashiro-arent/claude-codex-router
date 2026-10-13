@@ -4,6 +4,5 @@
   "tie_default": "codex",
   "full": 98,
   "claude_min_interval": 60,
-  "holidays": [],
   "prices": {}
 }

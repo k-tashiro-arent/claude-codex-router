@@ -1,7 +1,6 @@
 """Checks router.py's decisions, records, cost and limits in constructed situations. Times are built in Asia/Tokyo (the cost series is split by local-time days)."""
 import datetime
 import json
-import math
 import os
 import random
 import shutil
@@ -37,14 +36,13 @@ class TempDirCase(unittest.TestCase):
 
     def setUp(self):
         self.d = tempfile.mkdtemp()
-        self.saved = {k: getattr(route, k) for k in ('DATA', 'USAGE_LOG', 'COST_LOG', 'COST_STATE', 'PRICE_FILE', 'WEIGHTS_FILE',
+        self.saved = {k: getattr(route, k) for k in ('DATA', 'USAGE_LOG', 'COST_LOG', 'COST_STATE', 'PRICE_FILE',
                                                      'CLAUDE_HOME', 'CODEX_HOME', 'TP', '_prices', 'CONFIG', 'SAMPLE_STAMP', 'VERSION_FILE')}
         route.DATA = os.path.join(self.d, 'data')
         route.USAGE_LOG = os.path.join(route.DATA, 'usage.jsonl')
         route.COST_LOG = {s: os.path.join(route.DATA, f'cost-{s}.jsonl') for s in ('claude', 'codex')}
         route.COST_STATE = os.path.join(route.DATA, 'cost-state.json')
         route.PRICE_FILE = os.path.join(route.DATA, 'litellm-prices.json')
-        route.WEIGHTS_FILE = os.path.join(route.DATA, 'weights.json')
         route.SAMPLE_STAMP = os.path.join(route.DATA, 'last-sample')
         route.VERSION_FILE = os.path.join(self.d, '.version')
         route.CLAUDE_HOME, route.CODEX_HOME = os.path.join(self.d, 'claude'), os.path.join(self.d, 'codex')
@@ -68,12 +66,6 @@ class DefaultsTests(unittest.TestCase):
     def test_shipped_defaults_are_used(self):
         self.assertEqual((route.MAIN, route.GUARD_RISK, route.TIE_DEFAULT, route.FULL, route.CLAUDE_MIN_INTERVAL),
                          ('claude', 0.5, 'codex', 98.0, 60.0))
-        w, src = route.load_weights()
-        self.assertEqual(sorted(w), list(route.W_HOURS))
-        self.assertTrue(src.endswith('weights-default.json'))
-        for v in w.values():
-            self.assertEqual(len(v), len(route.PARTS))
-            self.assertAlmostEqual(sum(v), 1.0)
 
 
 class PriceTests(TempDirCase):
@@ -348,7 +340,7 @@ class DecideTests(unittest.TestCase):
     def st(self, u, X, win=10080, scoped=False):
         return {'u': u, 'X': X, 'win': win, 'scoped': scoped}
 
-    def test_compare_long_windows(self):
+    def test_compare_every_window(self):
         s = {'claude': {'claude-session': self.st(10, 0.1, 300), 'claude-weekly_all': self.st(40, 0.3)},
              'codex': {'codex-7d': self.st(20, 0.6)}}
         pick, why = route.decide_states(s, 'claude', guard=0.9)
@@ -409,7 +401,7 @@ class DecideTests(unittest.TestCase):
         both_tight = {'claude': {'claude-weekly_all': self.st(40, 0.7)},
                       'codex': {'codex-5h': self.st(70, 0.8, 300), 'codex-7d': self.st(5, 0.0)}}
         pick, why = route.decide_states(both_tight, 'claude')
-        self.assertEqual((pick, why['stage'], why['guard'], why['sub_tight']), ('codex', 'leftover', [], []))
+        self.assertEqual((pick, why['stage'], why['guard'], why['sub_tight']), ('claude', 'leftover', [], []))   # Codex's 5-hour window (0.2) is compared too
 
     def test_tie_follows_default(self):
         s = {'claude': {'claude-weekly_all': self.st(10, 0.2)}, 'codex': {'codex-7d': self.st(10, 0.2)}}
@@ -418,70 +410,82 @@ class DecideTests(unittest.TestCase):
 
 
 class ForecastTests(unittest.TestCase):
-    def _series(self, t_end, days, f):
+    def _events(self, t_end, days, f):
         ev = []
         for k in range(days * 96):
             t = t_end - days * D + k * route.Q + 1
             c = f(datetime.datetime.fromtimestamp(t))
             if c:
                 ev.append((t, c))
-        return route.CostSeries(ev, t_end)
+        return ev
 
     def test_repeatable_and_follows_the_daily_pattern(self):
-        t = at('2026-10-07 07:00')   # Wednesday morning
-        cs_ = self._series(t, 28, lambda d: 2.0 if d.weekday() < 5 and 9 <= d.hour < 18 else 0.0)   # $2 per 15 minutes on weekdays from 9:00 to 18:00
-        a = route.forecast(cs_, cs_.n, [4, 96])
-        self.assertEqual(a, route.forecast(cs_, cs_.n, [4, 96]))           # the same input gives the same samples
+        t = at('2026-10-07 07:00')
+        ev = self._events(t, 28, lambda d: 2.0 if 9 <= d.hour < 18 else 0.0)   # $2 per 15 minutes from 9:00 to 18:00
+        a = route.forecast(ev, t, [H, D])
+        self.assertEqual(a, route.forecast(ev, t, [H, D]))                  # the same input gives the same samples
         one_h, one_d = [sorted(v) for v in a]
         self.assertLess(one_h[len(one_h) // 2], 1.0)                       # almost no use from 7:00 to 8:00
         self.assertAlmostEqual(one_d[len(one_d) // 2], 72.0, delta=12)     # 9 hours × $8 in a day
 
-    def test_long_horizon_uses_pool2_and_weekend_is_quiet(self):
-        t = at('2026-10-10 00:00')   # Saturday 0:00
-        cs_ = self._series(t, 28, lambda d: 2.0 if d.weekday() < 5 and 9 <= d.hour < 18 else 0.0)
-        two_days, week = [sorted(v) for v in route.forecast(cs_, cs_.n, [192, 672])]
-        self.assertIsNone(route._bucket(672))
-        self.assertLess(two_days[len(two_days) // 2], 10.0)                # Saturday and Sunday
-        self.assertAlmostEqual(week[len(week) // 2], 360.0, delta=60)      # 5 weekdays × $72
+    def test_any_horizon_down_to_minutes(self):
+        t = at('2026-10-07 10:00')
+        ev = self._events(t, 14, lambda d: 2.0 if 9 <= d.hour < 18 else 0.0)
+        ten_min, ninety_min = [sorted(v) for v in route.forecast(ev, t, [600, 5400])]
+        self.assertEqual(len(ten_min), route.N_SAMP)
+        self.assertAlmostEqual(ten_min[len(ten_min) // 2], 2.0, delta=2.0)  # in use at 10:00: about $1.3 in 10 minutes
+        self.assertAlmostEqual(ninety_min[len(ninety_min) // 2], 12.0, delta=2.5)
 
-    def test_short_history_drops_parts_without_candidates(self):
+    def test_weekdays_are_not_used(self):
+        # moving every record and now by one day changes only the weekday, and the forecast stays the same
         t = at('2026-10-07 07:00')
-        cs_ = self._series(t, 3, lambda d: 1.0)                               # only 3 days ($1 per 15 minutes)
-        week = route.forecast(cs_, cs_.n, [672])[0]
+        rng = random.Random(4)
+        ev = self._events(t, 21, lambda d: rng.choice([0.0, 0.0, 1.0, 3.0]) if 9 <= d.hour < 20 else 0.0)
+        xs = [H, D, 3 * D]
+        self.assertEqual(route.forecast(ev, t, xs), route.forecast([(a + D, c) for a, c in ev], t + D, xs))
+
+    def test_horizon_longer_than_the_records_is_scaled(self):
+        t = at('2026-10-07 07:00')
+        ev = self._events(t, 3, lambda d: 1.0)                               # only 3 days ($1 per 15 minutes)
+        week = route.forecast(ev, t, [7 * D])[0]
         self.assertEqual(len(week), route.N_SAMP)
-        self.assertGreater(min(week), 100.0)                                 # zeros from parts without candidates are not mixed in (only the daily total forecast)
+        self.assertAlmostEqual(sum(week) / len(week), 4 * 24 * 7, delta=10)  # the pace of the records over 7 days
 
-    def test_ess_weights_reach_the_target(self):
-        rec = [0.5 ** (k / 7) for k in range(60)]
-        dist = [abs(math.sin(k)) * 3 for k in range(60)]
-        w = route._ess_weights([1.0] * 60, dist, 4)
-        self.assertAlmostEqual(sum(w) ** 2 / sum(v * v for v in w), 4, delta=0.05)  # effective number of points of the similarity-only weight
-        self.assertEqual(route._ess_weights(rec[:3], dist[:3], 4), rec[:3])        # with too few points, the recency weights only
-        a, b = route._ess_weights(rec, dist, 8), route._ess_weights(rec, [v + 1e-6 for v in dist[:-1]] + [dist[-1]], 8)
-        self.assertLess(max(abs(x / sum(a) - y / sum(b)) for x, y in zip(a, b)), 1e-3)   # a small change in distance changes the weights only a little
+    def test_all_past_outcomes_are_mixed_in_when_the_records_hold_few(self):
+        t = at('2026-10-07 07:00')
+        rng = random.Random(6)
+        ev = self._events(t, 4, lambda d: rng.choice([0.0, 1.0, 2.0]) if 9 <= d.hour < 18 else 0.0)
+        a = route.Analog().fit(ev, t).predict([D], 400, 0)[0]
+        b = route.Analog(plain=True).fit(ev, t).predict([D], 400, 1)[0]
+        k = round(400 * route.FC_MIX / (route.FC_MIX + (t - ev[0][0]) / D))         # about 4 outcomes of 1 day in the records: a third from all past outcomes
+        self.assertEqual(route.forecast(ev, t, [D])[0], a[:400 - k] + b[:k])
+        self.assertEqual(len(route.forecast(ev, t, [600])[0]), route.N_SAMP)
 
-    def test_knn_counts_a_day_once_and_moves_smoothly(self):
-        rng = random.Random(3)
-        amount = {}
-        t = at('2026-10-07 23:00')
+    def test_no_records_no_forecast(self):
+        t = at('2026-10-07 07:00')
+        self.assertEqual(route.forecast([], t, [600, D]), [None, None])
 
-        def f(d):
-            a = amount.setdefault(d.date(), rng.choice([0.5, 1.0, 2.0, 4.0]))
-            return a if 9 <= d.hour < 22 and rng.random() < 0.6 else 0.0
-        cs_ = self._series(t, 60, f)
-        knn = route.KNN(7)
-        i, xx = cs_.n - 2, 500
-        nn, w = knn.neighbours(cs_, i, xx)
-        self.assertEqual(len({cs_.cal(s)[2] for s in nn}), len(nn))            # one per day
-        nn2, w2 = knn.neighbours(cs_, i + 1, xx - 1)
-        p = {cs_.cal(s)[2]: v / sum(w) for s, v in zip(nn, w)}
-        q = {cs_.cal(s)[2]: v / sum(w2) for s, v in zip(nn2, w2)}
-        tv = sum(abs(p.get(k, 0) - q.get(k, 0)) for k in set(p) | set(q)) / 2
-        self.assertLess(tv, 0.2)                                              # shifting by 15 minutes does not swap the weights
+    def test_kernel_width_reaches_the_target(self):
+        t = at('2026-10-07 07:00')
+        rng = random.Random(5)
+        ev = self._events(t, 30, lambda d: rng.choice([0.0, 1.0, 2.0]) if 8 <= d.hour < 22 else 0.0)
+        m = route.Analog().fit(ev, t)
+        w = m._weights(len(m.grid))
+        self.assertAlmostEqual(sum(w) ** 2 / sum(v * v for v in w), route.FC_ESS, delta=0.05 * route.FC_ESS)
+        w = m._weights(1000)                                                 # short records: at most FC_FRAC of the starts
+        self.assertAlmostEqual(sum(w) ** 2 / sum(v * v for v in w), route.FC_FRAC * 1000, delta=0.05 * route.FC_FRAC * 1000)
 
-    def test_abs_mean(self):
-        self.assertAlmostEqual(route._abs_mean([0.0, 1.0], [0.0, 1.0]), 0.5)
-        self.assertAlmostEqual(route._abs_mean([3.0], [1.0, 2.0]), 1.5)
+    def test_held_back_time_is_replaced_by_the_pace_before(self):
+        # a weekly window reaches 95% 2 days after its start, and then almost nothing is used until the reset
+        t0 = at('2026-10-01 00:00')
+        ev = [(t0 + k * H + 1, 2.0) for k in range(48)]
+        rows = [{'ts': t0 + k * H, 'side': 'claude', 'id': 'weekly_all', 'win': 10080, 'u': min(2.0 * k, 99.0), 'r': int(t0 + 7 * D)} for k in range(0, 120, 6)]
+        sers = route.load_series('claude', rows)
+        held = route.held_back(sers.values(), t0 + 5 * D)
+        self.assertEqual([(a, b) for a, b, _, _ in held], [(t0 + 48 * H, t0 + 5 * D)])
+        un = route.unheld(ev, held)
+        self.assertAlmostEqual(sum(c for a, c in un if a >= t0 + 48 * H), 2.0 * 72, delta=0.01)   # $2 an hour also for the 3 held-back days
+        self.assertEqual([e for e in un if e[0] < t0 + 48 * H], ev)
 
 
 class WindowStateTests(TempDirCase):
@@ -521,11 +525,41 @@ class WindowStateTests(TempDirCase):
         self.assertIsNotNone(states['claude']['claude-session']['X'])  # also given for a full window
         self.assertEqual(notes, [])
 
-    def test_no_probability_without_any_cost_record(self):
+    def test_probability_from_usage_growth_without_any_cost_record(self):
+        # no cost records on this machine (e.g. a new machine): X comes from the window's own usage growth, even when the current read is not in the records yet
         t = at('2026-10-07 12:00')
-        states, notes = route.window_states([{'side': 'claude', 'id': 'weekly_all', 'win': 10080, 'u': 45.0, 'r': int(t + D)}], t, log=[])
-        self.assertIsNone(states['claude']['claude-weekly_all']['X'])
-        self.assertIn('no cost records', notes[0])
+        states, notes = route.window_states([{'side': 'codex', 'id': '7d', 'win': 10080, 'u': 90.0, 'r': int(t + 3 * D)},
+                                             {'side': 'claude', 'id': 'weekly_all', 'win': 10080, 'u': 30.0, 'r': int(t + 3 * D)}], t, log=[])
+        hi, lo = states['codex']['codex-7d'], states['claude']['claude-weekly_all']
+        self.assertEqual((hi['basis'], hi['remain_pct']), ('usage', 10.0))
+        self.assertGreater(hi['X'], 0.5)                     # 90% in 4 days, 10% left for 3 days
+        self.assertLess(lo['X'], 0.5)                        # 30% in 4 days, 70% left for 3 days
+        self.assertIn('exhaust probability from usage growth', notes[0])
+        pick, why = route.decide_states(states, 'claude')
+        self.assertEqual((pick, why['stage'], why['sub_tight']), ('claude', 'guard', ['codex-7d']))
+
+    def test_usage_growth_uses_the_reads_in_the_records(self):
+        # reads every hour: 1%/hour for the last day of the window so far. 60% used, 40 hours to the reset → about 40% more → X near the middle, not 0 or 1 only
+        t = at('2026-10-07 12:00')
+        r = int(t + 40 * H)
+        log = [{'ts': int(t - k * H), 'side': 'codex', 'id': '7d', 'win': 10080, 'u': 60.0 - k, 'r': r, 'src': 'live'} for k in range(24, 0, -1)]
+        states, _ = route.window_states([{'side': 'codex', 'id': '7d', 'win': 10080, 'u': 60.0, 'r': r}], t, log=log)
+        w = states['codex']['codex-7d']
+        self.assertEqual(w['basis'], 'usage')
+        self.assertIsNotNone(w['X'])
+        ev = route.usage_events(route.load_series('codex', log + [{'ts': int(t), 'side': 'codex', 'id': '7d', 'win': 10080, 'u': 60.0, 'r': r}])['7d'], t)
+        self.assertAlmostEqual(sum(v for _, v in ev), 60.0)   # the 36% seen at the first read is spread back to the window start, then 1% per read
+
+    def test_usage_growth_when_the_cost_gives_no_limit(self):
+        # there are cost records, but none in this window and no usage history: no limit in cost, so X comes from usage growth
+        t = at('2026-10-07 12:00')
+        self.write_costs('claude', [{'k': 'a', 'ts': t - 20 * D, 'model': 'claude-opus-5-5', 'out': 1000}])
+        states, _ = route.window_states([{'side': 'claude', 'id': 'weekly_all', 'win': 10080, 'u': 45.0, 'r': int(t + D)}], t, log=[])
+        w = states['claude']['claude-weekly_all']
+        self.assertIsNone(w['limit_usd'])
+        self.assertEqual(w['basis'], 'usage')
+        self.assertIn('limit unknown in cost', w['note'])
+        self.assertLess(w['X'], 0.5)                          # 45% in 6 days, 55% left for 1 day
 
 
 class CodexLoginTests(TempDirCase):
@@ -621,81 +655,6 @@ class RecordTests(TempDirCase):
             route.read_claude, route.read_codex = saved
         self.assertEqual(sorted((x['win'], x['u']) for x in rows), [(300, 40.0), (10080, 12.0)])
         self.assertIn('429', notes[0])
-
-    def test_calibrate_learns_weights_from_cost(self):
-        t = time.time()
-        rows = []
-        for k in range(20 * 24):
-            ts = t - 20 * D + k * H
-            d = datetime.datetime.fromtimestamp(ts)
-            if d.weekday() < 5 and 9 <= d.hour < 18:
-                rows.append({'k': str(k), 'ts': ts, 'model': 'claude-opus-5-5', 'out': 250000})
-        self.write_costs('claude', rows)
-        w = route.calibrate(quiet=True, every=16, step=0.25)
-        self.assertTrue(w)
-        for v in w.values():
-            self.assertAlmostEqual(sum(v), 1.0)
-        self.assertEqual(route.load_weights()[1], route.WEIGHTS_FILE)
-
-    def test_weights_learned_with_other_parts_are_not_used_and_relearned(self):
-        os.makedirs(route.DATA, exist_ok=True)
-        old = {'parts': list(route.PARTS), 'weights': {str(h): [1.0] + [0.0] * (len(route.PARTS) - 1) for h in route.W_HOURS}}
-        with open(route.WEIGHTS_FILE, 'w') as f:
-            json.dump(old, f)                                          # weights learned with the previous knn, without a form
-        self.assertTrue(route.load_weights()[1].endswith('weights-default.json'))
-        t = time.time()
-        rows = []
-        for k in range(20 * 24):
-            ts = t - 20 * D + k * H
-            if datetime.datetime.fromtimestamp(ts).hour in (10, 14):
-                rows.append({'k': str(k), 'ts': ts, 'model': 'claude-opus-5-5', 'out': 250000})
-        self.write_costs('claude', rows)
-        saved = route.calibrate
-        route.calibrate = lambda quiet=False: saved(quiet=quiet, every=16, step=0.25)
-        try:
-            self.assertTrue(route.maybe_calibrate(t))                 # relearned if the form differs, even when newer than 1 day
-            self.assertFalse(route.maybe_calibrate(t))                # not learned again after relearning
-        finally:
-            route.calibrate = saved
-        self.assertEqual(route.load_weights()[1], route.WEIGHTS_FILE)
-
-    def test_unlearned_hours_use_shipped_weights(self):
-        os.makedirs(route.DATA, exist_ok=True)
-        one = [1.0] + [0.0] * (len(route.PARTS) - 1)
-        with open(route.WEIGHTS_FILE, 'w') as f:
-            json.dump({'form': route.WEIGHTS_FORM, 'parts': list(route.PARTS), 'weights': {'1': one}}, f)
-        w, src = route.load_weights()
-        default = route._read_weights(route._conf('weights-default.json'))
-        self.assertEqual(src, route.WEIGHTS_FILE)
-        self.assertEqual(w[1], one)
-        for h in route.W_HOURS[1:]:
-            self.assertEqual(w[h], default[h])
-
-    def test_relearning_without_enough_origins_waits_a_day(self):
-        t = time.time()
-        calls = []
-        saved = route.calibrate
-        route.calibrate = lambda quiet=False: calls.append(1) or saved(quiet=quiet, every=16, step=0.25)
-        try:
-            rows = [{'k': str(k), 'ts': t - 8 * D + k * H, 'model': 'claude-opus-5-5', 'out': 250000} for k in range(8 * 24)]
-            self.write_costs('claude', rows)
-            self.assertFalse(route.maybe_calibrate(t))                # 8 days: not long enough for 20 learnable starts, so it is not tried
-            self.assertEqual(calls, [])
-            rows = [{'k': f'b{k}', 'ts': t - 9 * D + k * H, 'model': 'claude-opus-5-5', 'out': 250000} for k in range(24)]
-            self.write_costs('claude', rows)
-            self.assertFalse(route.maybe_calibrate(t))                # 9 days: tried, but with starts every 16 slots there are fewer than 20
-            self.assertTrue(os.path.exists(route.WEIGHTS_FILE))       # still written, keeping the time of the attempt
-            self.assertFalse(route.maybe_calibrate(t + 300))          # not tried again within a day
-        finally:
-            route.calibrate = saved
-        self.assertEqual(len(calls), 1)
-        self.assertTrue(route.load_weights()[1].endswith('weights-default.json'))
-
-    def test_calibrate_waits_for_enough_days(self):
-        t = time.time()
-        self.write_costs('claude', [{'k': 'a', 'ts': t - 3 * D, 'model': 'claude-opus-5-5', 'out': 1000}])
-        self.assertFalse(route.maybe_calibrate(t))
-        self.assertFalse(os.path.exists(route.WEIGHTS_FILE))
 
 
 if __name__ == '__main__':

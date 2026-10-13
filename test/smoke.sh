@@ -121,7 +121,7 @@ install_once() {
   fi
 }
 install_once
-for f in bin/router.py weights-default.json config.json uninstall.sh .version; do
+for f in bin/router.py config.json uninstall.sh .version; do
   [[ -f "$DIR/$f" ]] || fail "$f missing after install"
 done
 [[ "$(grep -c '# claude-codex-router$' "$work/crontab.txt")" == 1 ]] || fail "the crontab line is not exactly 1 line"
@@ -148,9 +148,10 @@ assert d['pick'] in ('claude', 'codex') and d['main'] == 'claude', d
 assert set(w) == {'claude-session', 'claude-weekly_all', 'claude-weekly_scoped:Fable', 'codex-7d'}, w.keys()
 assert w['codex-7d']['u'] == 30 and w['claude-weekly_all']['u'] == 20 and w['claude-session']['win'] == 300
 assert w['claude-weekly_scoped:Fable']['scoped'] and not w['claude-weekly_all']['scoped']
-assert all(v['X'] is None for v in w.values())                      # there are conversation logs, but the cost in the current windows is still 0 (no limit)
-assert d['claude_L'] == 0.5 and d['codex_L'] == 0.5 and not d['errors'] and d['sub_tight'] == [] and d['full'] == []
-assert 'limit unknown' in w['codex-7d']['note'], w['codex-7d']
+# there are conversation logs, but the cost in the current windows is still 0 (no limit in cost): X comes from usage growth
+assert all(v['X'] is not None and v['basis'] == 'usage' for k, v in w.items() if not v['scoped']), w
+assert 0 <= d['claude_L'] <= 1 and 0 <= d['codex_L'] <= 1 and not d['errors'] and d['sub_tight'] == [] and d['full'] == []
+assert 'limit unknown in cost' in w['codex-7d']['note'], w['codex-7d']
 EOF
 [[ "$(wc -l < "$DIR/data/usage.jsonl")" -eq 4 ]] || fail "the records are not 4 lines"
 out=$(python3 "$DIR/bin/router.py" now --json --main codex) || true
@@ -281,11 +282,9 @@ grep -q '^disable-linger ' "$work/loginctl.log" && [[ ! -f "$DIR/.linger" ]] || 
 [[ ! -f "$HOME/.config/systemd/user/claude-codex-router-sample.timer" ]] || fail "the timer definition remains after uninstall"
 pass "systemd: enables linger, finishes installing even when systemd is unreachable, reverted by uninstall"
 
-# 10) now reports when periodic sampling has stopped (reinstalling checks the weights: the cost records are under 9 days, so nothing is learned)
+# 10) now reports when periodic sampling has stopped
 bash "$SRC/install.sh" > /dev/null
 python3 "$DIR/bin/router.py" sample > /dev/null || true
-bash "$SRC/install.sh" > "$work/install-w.log"
-grep -q '^  weights: weights kept$' "$work/install-w.log" || fail "install did not check the weights ($(grep weights "$work/install-w.log"))"
 touch -d '-2 hours' "$DIR/data/last-sample"
 out=$(python3 "$DIR/bin/router.py" now --json) || true
 python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert any("stopped" in n for n in d["notes"]), d["notes"]' "$out" || fail "does not report that periodic sampling has stopped"

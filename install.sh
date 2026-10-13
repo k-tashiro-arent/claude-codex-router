@@ -3,19 +3,18 @@
 #
 # What it does:
 #   1) Dependency check (python3 is required; missing Codex or Claude Code login info only gives a warning)
-#   2) Places router.py and the bundled weights (weights-default.json) in $CLAUDE_CODEX_ROUTER_DIR (default ~/.claude/codex-router)
+#   2) Places router.py in $CLAUDE_CODEX_ROUTER_DIR (default ~/.claude/codex-router)
 #   3) Places the default config.json (an existing one is not overwritten)
 #   4) Sets up a timer that calls `router.py sample` every 5 minutes
 #        the first usable one, in the order systemd user timer → macOS launchd → crontab
 #        with systemd, enables linger (the user's systemd starts at boot and the timer runs even when not logged in.
 #        It does not stop after a WSL restart either). If this installer enabled it, uninstall.sh reverts it
 #        selectable with CLAUDE_CODEX_ROUTER_SCHEDULER=systemd|launchd|cron|none (none sets up nothing)
-#   5) If the mixing weights (data/weights.json) were learned with parts different from the current router, or are old, relearns them on the spot
-#   6) Optionally installs the delegation skills (asks; CLAUDE_CODEX_ROUTER_SKILLS=claude|codex|both|none answers without asking)
+#   5) Optionally installs the delegation skills (asks; CLAUDE_CODEX_ROUTER_SKILLS=claude|codex|both|none answers without asking)
 #        claude: codex-offload for Claude Code (${CLAUDE_CONFIG_DIR:-~/.claude}/skills/codex-offload)
 #        codex : claude-offload for Codex (~/.agents/skills/claude-offload) and a Codex rule that lets its two scripts run outside the sandbox
 #        skills this installer placed and nobody edited are updated on reinstall; edited or someone else's skills are kept
-#   7) Places uninstall.sh and records the version
+#   6) Places uninstall.sh and records the version
 # The usage records (data/) are not overwritten.
 set -euo pipefail
 
@@ -52,8 +51,7 @@ fi
 mkdir -p "$DIR/bin" "$DIR/data"
 cp "$SRC/bin/router.py" "$DIR/bin/router.py"
 chmod +x "$DIR/bin/router.py"
-cp "$SRC/defaults/weights-default.json" "$DIR/weights-default.json"
-rm -f "$DIR/sigma-default.json"   # table from an earlier version (not used)
+rm -f "$DIR/sigma-default.json" "$DIR/weights-default.json" "$DIR/data/weights.json"   # tables of earlier versions (not used)
 
 # 3) Default settings (the user's settings are not overwritten)
 [[ -f "$DIR/config.json" ]] || cp "$SRC/defaults/config.json" "$DIR/config.json"
@@ -77,7 +75,7 @@ if [[ "$SCHED" == "auto" ]]; then
     SCHED=cron
   else
     SCHED=none
-    echo "  WARNING: none of systemd, launchd or crontab is available. Call router.py sample periodically yourself (otherwise the usage records get gaps, and relearning the mixing weights and updating the prices are delayed)."
+    echo "  WARNING: none of systemd, launchd or crontab is available. Call router.py sample periodically yourself (otherwise the usage records get gaps, and updating the prices is delayed)."
   fi
 fi
 
@@ -175,12 +173,7 @@ EOF
 esac
 printf '%s\n' "$SCHED" > "$DIR/.scheduler"
 
-# 5) Mixing weights: on update or reinstall, if they do not match the current forecasting method, are old, or are missing, relearn them on the spot (tens of seconds) when there are cost records long enough to learn from (about 9 days)
-if [[ -f "$DIR/data/cost-state.json" ]]; then
-  echo "  weights: $(CLAUDE_CODEX_ROUTER_DIR="$DIR" "$PY" "$DIR/bin/router.py" calibrate --if-needed 2>&1 | tail -1)"
-fi
-
-# 6) Delegation skills (optional)
+# 5) Delegation skills (optional)
 CLAUDE_SKILLS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills"
 CODEX_SKILLS="$HOME/.agents/skills"
 CODEX_RULES="${CODEX_HOME:-$HOME/.codex}/rules/$NAME.rules"
@@ -268,7 +261,7 @@ EOF
   fi
 fi
 
-# 7) uninstall and version
+# 6) uninstall and version
 cp "$SRC/uninstall.sh" "$DIR/uninstall.sh"
 chmod +x "$DIR/uninstall.sh"
 printf '%s\n' "$VERSION" > "$DIR/.version"
