@@ -281,6 +281,9 @@ class ParseTests(unittest.TestCase):
         rows = route.parse_codex(d)
         self.assertEqual([(x['win'], x['u'], bool(x.get('scoped'))) for x in rows], [(10080, 1.0, False), (43200, 2.0, False), (300, 3.0, True)])
 
+    def test_length_labels(self):
+        self.assertEqual([route.win_label(w) for w in (300, 299.78, 10080, 10079.93, 90, 43200, None)], ['5h', '5h', '7d', '7d', '1.5h', '30d', '?'])
+
     def test_rows_without_id(self):
         # Claude: a provisional kind (joined by reset times in load_series), not a kind decoded from a length; Codex: by the length the API gave
         self.assertEqual(route.row_id({'side': 'claude', 'win': 300}), 'legacy:300')

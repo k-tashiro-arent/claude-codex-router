@@ -746,11 +746,12 @@ def _join_legacy(reads):
 
 
 def win_label(win_min):
+    """Length (min) as hours or days, to 1 decimal (an estimated length such as 299.8 min shows as 5h)."""
     try:
-        w = int(win_min)
+        w = float(win_min)
     except (TypeError, ValueError):
         return '?'
-    return f'{w // 60}h' if w < 1440 else f'{w // 1440}d'
+    return f'{round(w / 60, 1):g}h' if w < 1440 - 3 else f'{round(w / 1440, 1):g}d'
 
 
 class Series:
