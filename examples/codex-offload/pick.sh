@@ -3,6 +3,8 @@
 # usage: pick.sh [--main claude|codex]   (--main: the delegating side; default: the router's setting, claude unless changed)
 #   If claude-codex-router ($CLAUDE_CODEX_ROUTER_DIR, default ~/.claude/codex-router) is installed, follows its decision (now --json).
 #   When it is not installed, did not answer, or its answer is unreadable: codex (Codex first).
+#   A flag file ($CLAUDE_CODEX_ROUTER_FORCE_FILE, default $CLAUDE_CODEX_ROUTER_DIR/force) holding claude or codex fixes the target to that side
+#   without calling the router; with anything else in it, it is ignored (and the line says so).
 # Output is one line in English: "<codex|claude> <reason>". The exit code is always 0 (failing to pick does not stop the delegation).
 set -u
 MAIN=()
@@ -10,13 +12,22 @@ if [ "${1:-}" = --main ]; then
   case "${2:-}" in claude|codex) MAIN=(--main "$2");; *) echo "codex pick.sh: --main must be claude|codex; defaulting to Codex"; exit 0;; esac
 fi
 DIR="${CLAUDE_CODEX_ROUTER_DIR:-$HOME/.claude/codex-router}"
+FORCE="${CLAUDE_CODEX_ROUTER_FORCE_FILE:-$DIR/force}"
+EXTRA_NOTE=""
+if [ -e "$FORCE" ]; then
+  FIXED="$(head -n 1 "$FORCE" 2>/dev/null | tr -d '[:space:]')"
+  case "$FIXED" in
+    claude|codex) echo "$FIXED fixed by the flag file ($FORCE); remove it to let claude-codex-router choose"; exit 0;;
+    *) EXTRA_NOTE="; flag file $FORCE ignored (write claude or codex in it)";;
+  esac
+fi
 ROUTER="$DIR/bin/router.py"
 if [ ! -f "$ROUTER" ]; then
-  echo "codex claude-codex-router not installed ($ROUTER); defaulting to Codex"
+  echo "codex claude-codex-router not installed ($ROUTER); defaulting to Codex$EXTRA_NOTE"
   exit 0
 fi
 if ! command -v python3 >/dev/null 2>&1; then
-  echo "codex python3 not found; defaulting to Codex"
+  echo "codex python3 not found; defaulting to Codex$EXTRA_NOTE"
   exit 0
 fi
 # the timeout is measured with python3 (the timeout command is not standard on macOS). Overriding the seconds is for tests
@@ -40,8 +51,8 @@ if p not in ("claude", "codex"):
 why = d.get("reason") or ""
 if d.get("claude_left_usd") is not None and d.get("codex_left_usd") is not None:
     why += " (expected leftover Claude $%.0f / Codex $%.0f)" % (d["claude_left_usd"], d["codex_left_usd"])
-elif d.get("claude_L") is not None:
-    why += " (leftover probability Claude %.2f / Codex %.2f)" % (d["claude_L"], d["codex_L"])
+elif d.get("claude_L") is not None or d.get("codex_L") is not None:   # one side may have none (no exhaust probability)
+    why += " (leftover probability Claude %s / Codex %s)" % tuple("unknown" if d.get(k) is None else "%.2f" % d[k] for k in ("claude_L", "codex_L"))
 for key, label in (("full", "full"), ("guard", "guard (main side)")):
     if d.get(key):
         why += "; %s: %s" % (label, ", ".join(d[key]))
@@ -52,7 +63,7 @@ if d.get("notes"):
 print(p, "claude-codex-router:", why)
 ' 2>/dev/null)"
 if [ -z "$LINE" ]; then
-  echo "codex claude-codex-router gave no answer (rc=$RC); defaulting to Codex"
+  echo "codex claude-codex-router gave no answer (rc=$RC); defaulting to Codex$EXTRA_NOTE"
   exit 0
 fi
-echo "$LINE"
+echo "$LINE$EXTRA_NOTE"

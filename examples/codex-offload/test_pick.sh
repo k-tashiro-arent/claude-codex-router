@@ -32,6 +32,12 @@ check "router picks claude (probability, an older router or leftover_prob)" clau
 fake 'import json; print(json.dumps({"pick": "codex", "reason": "leftover", "claude_left_usd": 30.4, "codex_left_usd": 120.0, "claude_L": 0.9, "codex_L": 0.5, "guard": [], "full": [], "errors": []}))'
 check "router picks codex by the expected leftover cost" codex "leftover (expected leftover Claude \$30 / Codex \$120)"
 
+fake 'import json; print(json.dumps({"pick": "claude", "reason": "tie", "tie": True, "claude_L": 0.6, "codex_L": None, "guard": [], "full": [], "errors": []}))'
+check "follows the decision when one side has no leftover probability (tie)" claude "tie (leftover probability Claude 0.60 / Codex unknown)"
+
+fake 'import json; print(json.dumps({"pick": "codex", "reason": "tie", "tie": True, "claude_L": None, "codex_L": 0.7, "guard": [], "full": [], "errors": []}))'
+check "follows the decision when the other side has no leftover probability (tie)" codex "tie (leftover probability Claude unknown / Codex 0.70)"
+
 fake 'import json, sys; print(json.dumps({"pick": "codex", "reason": "guard", "claude_L": 0.4, "codex_L": 0.5, "guard": ["claude-7d"], "full": [], "errors": []}))'
 check "router picks codex (guard)" codex "guard (main side): claude-7d"
 
@@ -57,6 +63,20 @@ fake 'import json; print(json.dumps({"pick": "claude", "reason": "leftover", "cl
 mkdir -p "$work/onlypy"
 for c in python3 bash grep; do ln -sf "$(command -v "$c")" "$work/onlypy/$c"; done   # no timeout command
 PATH="$work/onlypy" check "no timeout command (macOS default)" claude "leftover"
+
+fake 'import json; print(json.dumps({"pick": "codex", "reason": "leftover", "claude_L": 0.4, "codex_L": 0.6, "guard": [], "full": [], "errors": []}))'
+echo claude > "$work/r/force"
+check "the flag file fixes claude even when the router picks codex" claude "fixed by the flag file"
+printf ' codex \n' > "$work/r/force"
+check "the flag file fixes codex (spaces around the word allowed)" codex "fixed by the flag file"
+: > "$work/r/force"
+check "an empty flag file is ignored and said so" codex "leftover (leftover probability Claude 0.40 / Codex 0.60); flag file $work/r/force ignored"
+rm -f "$work/r/force"
+mkdir -p "$work/flag"; echo claude > "$work/flag/f"
+CLAUDE_CODEX_ROUTER_FORCE_FILE="$work/flag/f" check "the flag file's place can be changed" claude "fixed by the flag file ($work/flag/f)"
+check "without the flag file the router decides" codex "claude-codex-router: leftover"
+rm -rf "$work/r"; echo claude > "$work/flag/f"
+CLAUDE_CODEX_ROUTER_FORCE_FILE="$work/flag/f" check "the flag file works without the router installed" claude "fixed by the flag file"
 
 fake 'import json, sys; print(json.dumps({"pick": "claude", "reason": " ".join(sys.argv[1:]), "guard": [], "full": [], "errors": []}))'
 if CLAUDE_CODEX_ROUTER_DIR="$work/r" bash "$HERE/pick.sh" --main codex | grep -q 'now --json --main codex'; then

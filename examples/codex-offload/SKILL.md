@@ -19,8 +19,9 @@ The scope is **all of reading, running and editing**.
 ~/.claude/skills/codex-offload/pick.sh --main claude
 ```
 - The output is one line, "`<codex|claude> <reason>`". Hand off to the side named by the first word.
-  - If claude-codex-router (`~/.claude/codex-router/bin/router.py`, location `CLAUDE_CODEX_ROUTER_DIR`) is installed, follow its decision (for both contracts, the cost expected to be left unused before the reset, and the guard).
+  - If claude-codex-router (`~/.claude/codex-router/bin/router.py`, location `CLAUDE_CODEX_ROUTER_DIR`) is installed, follow its decision (the cost each contract is expected to leave unused by the next reset of its longest window, and the guard on the delegating side).
   - When it is not installed, did not answer, or its answer is unreadable: `codex` (Codex first).
+  - The flag file `~/.claude/codex-router/force` (location `CLAUDE_CODEX_ROUTER_FORCE_FILE`) fixes the target: while it holds `claude` or `codex`, that side is returned without calling the router. Write it with `echo claude > …` or `echo codex > …` and remove it with `rm` (only when the requester asks). Anything else in it is ignored, and the line says so.
 - When delegating several tasks in parallel, call it once for each (every call reads the current usage windows; it takes a few seconds).
 - **codex** → run.sh as in "How to call it" below.
 - **claude** → "Handing off to a Claude subagent" below.
@@ -36,7 +37,7 @@ CODEX_EOF
   - Running tests writes artifacts (build output, caches), so use write for it.
 - `cwd` is an absolute path. Give each task its own `outdir` under the scratchpad (e.g. `<scratchpad>/cx-<short name>`).
   run.sh leaves `prompt.md` (the actual instructions with the preamble), `events.jsonl`, `stderr.txt`, `last.txt` (Codex's final report) and `summary.txt`.
-- Stdout is only the summary: `rc`, seconds taken, whether `UNAVAILABLE:` / `NO-RESULT:` appeared, for a git working tree **the changed files seen from the status diff**, and a `WARNING` when the tree changed in read mode.
+- Stdout is only the summary: `rc`, seconds taken, whether `UNAVAILABLE:` / `NO-RESULT:` appeared, for a git working tree **the changed files seen from the status diff**, and a `WARNING` when `git status` changed in read mode (a further change to a file that was already modified before does not change it, so it is not seen).
 - **Start long or parallel work with Bash's `run_in_background: true`** (you are notified when it ends; the foreground limit is 10 minutes). Independent investigations may be started at the same time.
   **Do not run two writes on the same working tree at the same time** (the changes mix and you cannot tell which change came from which).
 - Model and effort are the defaults in `~/.codex/config.toml`. Add `-e high` only for hard design decisions and reviews.

@@ -24,8 +24,9 @@ The claude-codex-router installer adds a Codex rule (`~/.codex/rules/claude-code
 ~/.agents/skills/claude-offload/pick.sh --main codex
 ```
 - The output is one line, "`<codex|claude> <reason>`". Follow the first word.
-  - If claude-codex-router (`~/.claude/codex-router/bin/router.py`, location `CLAUDE_CODEX_ROUTER_DIR`) is installed, follow its decision (for both contracts, the cost expected to be left unused before the reset, and the guard).
+  - If claude-codex-router (`~/.claude/codex-router/bin/router.py`, location `CLAUDE_CODEX_ROUTER_DIR`) is installed, follow its decision (the cost each contract is expected to leave unused by the next reset of its longest window, and the guard on the delegating side).
   - When it is not installed, did not answer, or its answer is unreadable: `codex` (do it yourself).
+  - The flag file `~/.claude/codex-router/force` (location `CLAUDE_CODEX_ROUTER_FORCE_FILE`) fixes the target: while it holds `claude` or `codex`, that side is returned without calling the router. Write it with `echo claude > …` or `echo codex > …` and remove it with `rm` (only when the requester asks). Anything else in it is ignored, and the line says so.
 - When delegating several tasks in parallel, call it once for each (every call reads the current usage windows; it takes a few seconds).
 - **claude** → run.sh as in "How to call it" below.
 - **codex** → do the work yourself.
@@ -40,7 +41,7 @@ CLAUDE_EOF
 - `read` lets Claude Code read and search only; `write` lets it edit files and run any command (tests, builds). **If nothing needs to be written, use read.**
 - `cwd` is an absolute path. Give each task its own `outdir` (e.g. `/tmp/claude-offload/<short name>`).
   run.sh leaves `prompt.md` (the actual instructions with the preamble), `result.json`, `stderr.txt`, `last.txt` (Claude Code's final report) and `summary.txt`.
-- Stdout is only the summary: `rc`, seconds taken, whether `UNAVAILABLE:` / `NO-RESULT:` appeared, for a git working tree **the changed files seen from the status diff**, and a `WARNING` when the tree changed in read mode.
+- Stdout is only the summary: `rc`, seconds taken, whether `UNAVAILABLE:` / `NO-RESULT:` appeared, for a git working tree **the changed files seen from the status diff**, and a `WARNING` when `git status` changed in read mode (a further change to a file that was already modified before does not change it, so it is not seen).
 - **Do not run two writes on the same working tree at the same time** (the changes mix and you cannot tell which change came from which).
 - The model is Claude Code's default. Pass `-m` only when the requester asked for a specific model.
 - Each call is a new Claude Code session. To redo, write the key points of the previous `last.txt` in the body and start a new run.
@@ -61,5 +62,5 @@ run.sh automatically prepends the preamble (`preamble.md`: no changes outside th
 - In the report to the requester, write the parts left to Claude Code separately from the parts you verified yourself.
 
 ## When it is unavailable
-If handing off to Claude Code gives `UNAVAILABLE:` (usage limit, rate limit, authentication, connection), do the work yourself, and write one line in the report to the requester saying so.
+If handing off to Claude Code gives `UNAVAILABLE:` (usage limit, rate limit, authentication, connection, or the `claude` command not found: then run.sh prints it on stdout and leaves no files), do the work yourself, and write one line in the report to the requester saying so.
 `NO-RESULT:` (it ran but the report is empty) is not an availability problem. Look at the end of `stderr.txt` and `result.json` to find the cause.

@@ -4,8 +4,9 @@
 Main side and sub side: the side used mainly is set by --main claude|codex (or main in config, default claude). The other side is the sub side.
 
 Windows: every window the API returns is handled (their number, length and limit are assumed to change).
-  Claude: each window in limits of the usage API (every kind). The API gives no length: it is estimated from the reads (estimate_length: the largest,
-          over the periods, of the reset minus the period's first read); until some period's start has been read closely, only a lower bound.
+  Claude: each window in limits of the usage API (every kind). The API gives no length: it is estimated from the reads (estimate_length: the median,
+          over the latest periods whose start lies closely between two reads, of the reset minus the middle of those reads); until some period's
+          start has been read closely, only a lower bound (the largest reset minus the period's first read).
           Model-scoped windows (windows with a scope) are shown only, not used for the decision.
   Codex : every window in the response, under any key (the API returns the length); all are used. Kinds are named by the exact length
           (in days, hours or minutes, whichever divides it: 7d, 5h, 90m).
@@ -17,16 +18,17 @@ Usage is counted in cost (USD): token counts in the conversation logs × per-mod
   Use on other machines or on claude.ai is not included.
 
 Limit amount (estimated per window at run time):
-  If usage u is LIMIT_NOW_U (10%) or more, from the current window: 100 × cost from the window start (reset − window length) until now ÷ u.
-  Below that, from history: going back 1 hour at a time from just before now, cost until the usage growth reaches one window's worth (100%) ÷ usage growth
-  (excluding time spent at the limit and time before the usage records start; up to 28 days; not used if the growth is under 20%). If that is unavailable too, from the current window.
+  If usage u is LIMIT_NOW_U (10%) or more, from the current window: 100 × cost from the window start (reset − window length) until now ÷ u
+  (only when the length is known; history first when the cost records start after the window start or the window's cost is 0: see limit_usd).
+  Below that, from history: going back 1 hour at a time from just before now, 100 × cost until the usage growth reaches one window's worth (100%) ÷ usage growth (%)
+  (excluding time spent at the limit and time before the usage records start; no fixed span; not used if the growth is under 20%). If that is unavailable too, from the current window.
 Exhaust probability X (probability of reaching the limit before the window's next reset) = P(S ≥ limit × (1 − u/100)).
   S is the distribution of the cost that would be used from now until the reset if there were no limit (x = reset − now, in seconds; any length).
-  It is built as samples of what actually followed past points in time (Analog): for past starts s every 5 minutes back from now,
+  It is built as samples of what actually followed past points in time (Analog): for past starts s every 5 minutes back from now (up to 140 days),
   the actual cost in [s, s + x); starts whose state was like now weigh more (state: decayed sums of the cost before the time, time constants
   1 hour / 6 hours / 1 day / 7 days, and the time of day), and more recent starts weigh more (half weight after 14 days).
   The kernel width is set so that about 1000 starts count (with short records, 30% of the starts). x longer than half of the records: the sum of
-  outcomes for half of the records drawn independently, as many as needed to cover x.
+  outcomes for half of the records drawn independently, as many as needed to cover x, scaled to x.
   This is mixed with the distribution of all past outcomes (no state, no recency), whose share is 2 / (2 + n_b), n_b = (records' length) / x: when the
   records hold few outcomes of length x, choosing among them by the state is unreliable.
   Weekdays and days off are not assumed or classified. Nothing is learned from other users' records.
@@ -34,7 +36,8 @@ Exhaust probability X (probability of reaching the limit before the window's nex
   the inputs are replaced by use at the pace from the window start until that read (the use if there were no limit).
   A window with no cost to estimate from (no cost records on this machine for that side, or no limit in cost) gets X from its own usage growth instead:
     the same forecast run on the window's usage growth (in %; the growth seen at the first read of a period is spread evenly back to the period start),
-    X = P(growth until the reset ≥ 100 − u). With a single read the series is flat, so X is 0 or 1 until reads accumulate.
+    X = P(growth until the reset ≥ 100 − u). With a single read the growth is only the one spread evenly back to the period start, until reads accumulate.
+  No X when the cost records are too short for a forecast, or the window's length is not known yet (no period read; the window is not used).
 
 Decision (once a stage decides, later stages are not looked at):
   1. Full: if only one side has reached the limit (full in config, default 98%) in some window, the other side. If both have, go on.
@@ -47,11 +50,11 @@ Decision (once a stage decides, later stages are not looked at):
      the longest counts and the earliest reset is taken). Along forecast paths of the use until T, the use actually possible is cut by every window's
      remaining amount in each of its periods (a period starting before T makes its whole limit usable); the cost that could still be used on top,
      as far as every window's period allows, is the leftover (contract_leftover); its mean over the paths is compared.
-     If a side has a window without a limit in cost (X from usage growth), the cost cannot be compared: the leftover probability 1 − X of each side's
-     longest window is compared instead, reason leftover_prob. If equal, or a side has no X at all, tie_default in config (default codex).
+     If a side has no leftover in cost (a window without a limit in cost, X from usage growth, or a window without X), the cost cannot be compared:
+     the leftover probability 1 − X of each side's longest window with X is compared instead, reason leftover_prob. If equal, or a side has no X at all, tie_default in config (default codex).
 
 Usage records (each environment accumulates its own):
-  <DIR>/data/usage.jsonl. 1 line = 1 read of 1 window {"ts", "side", "id": window kind, "win": window length (min), "u": usage, "r": reset time,
+  <DIR>/data/usage.jsonl. 1 line = 1 read of 1 window {"ts", "side", "id": window kind, "win": window length (min; the API gives it for Codex only, lines of earlier versions have it for Claude too), "u": usage, "r": reset time,
   "scoped": whether the window is model-scoped, "src"}. Lines without id: Codex by the length; Claude (imported or from earlier versions) joined to
   the kind with the same reset times.
   DIR is the environment variable CLAUDE_CODEX_ROUTER_DIR (default ~/.claude/codex-router).
@@ -82,7 +85,7 @@ usage:
   router.py sample      read both and record; add cost rows from the conversation logs (the timer calls this every 5 min)
 
 now --json fields: pick, main, reason (full|guard|tie|leftover|leftover_prob|codex_unreadable|claude_unreadable|both_unreadable), tie,
-  guard (main-side windows over guard_risk, when they sent the pick to the sub side), full (all windows at full),
+  guard (main-side windows over guard_risk, when they sent the pick to the sub side), full (all windows at full, not model-scoped),
   claude_left_usd, codex_left_usd (expected leftover $ of each contract), claude_L, codex_L (leftover probability), windows, errors, notes. Data and settings: $CLAUDE_CODEX_ROUTER_DIR (default ~/.claude/codex-router)."""
 
 HERE = os.path.dirname(os.path.abspath(__file__))
