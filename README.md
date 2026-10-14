@@ -32,7 +32,7 @@ pick: codex (reason leftover, main claude)
 
 ## 動作環境
 
-- **OS**：Linux/WSL2。macOS は試験的な対応です(下の「macOS について」)。Windows ネイティブは対象外。
+- **OS**：Linux/WSL2・macOS(下の「macOS について」)。Windows ネイティブは対象外。
 - **依存**：`python3`(3.8 以上。標準ライブラリだけ)。移譲のスキルを使うときは、移譲先のコマンド(`codex` か `claude`)も要ります。
 - **Claude**：使用枠がある Claude のプラン(Pro・Max・Team など)で Claude Code にログインしていること。API キーで使っている場合は対象外です(期間ごとの上限がありません)。
 - **Codex**：使用枠がある ChatGPT のプラン(Plus・Pro など)で Codex にログインしていること。API キーで使っている場合は対象外です(期間ごとの上限がありません)。
@@ -212,7 +212,6 @@ codex claude-codex-router: guard (expected leftover Claude $40 / Codex $95); gua
 
 - Claude Code が資格情報を Keychain に置いている場合は、`security find-generic-password -s "Claude Code-credentials"` で読みます。
 - タイマーは launchd に置きます。
-- どちらも試験的な対応です。うまく動かないときは issue で知らせてください。
 
 ## 詳しい仕組み
 

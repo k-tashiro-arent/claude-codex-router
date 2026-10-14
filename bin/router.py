@@ -61,7 +61,7 @@ Usage records (each environment accumulates its own):
   How they are read (neither calls a model, so the windows are not used up):
     Claude: GET https://api.anthropic.com/api/oauth/usage (same as /usage in Claude Code; not publicly documented).
             The token is only read from $CLAUDE_CONFIG_DIR (default ~/.claude)/.credentials.json and never refreshed.
-            On macOS, when it is stored in the Keychain, it is read with the security command (experimental support).
+            On macOS, when it is stored in the Keychain, it is read with the security command.
     Codex : GET https://chatgpt.com/backend-api/wham/usage (the endpoint written in the Codex CLI executable; not publicly documented).
             The token is only read from $CODEX_HOME (default ~/.codex)/auth.json and never refreshed.
 
@@ -1247,7 +1247,7 @@ def claude_credentials():
     f = os.path.join(CLAUDE_HOME, '.credentials.json')
     if os.path.exists(f):
         return json.load(open(f))['claudeAiOauth']
-    if sys.platform == 'darwin':   # on macOS they are stored in the Keychain (experimental support)
+    if sys.platform == 'darwin':   # on macOS they are stored in the Keychain
         p = subprocess.run(['security', 'find-generic-password', '-s', 'Claude Code-credentials', '-w'],
                            capture_output=True, text=True, timeout=10)
         if p.returncode == 0 and p.stdout.strip():
