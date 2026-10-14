@@ -20,11 +20,11 @@ Claude のプラン(Pro・Max など)と、Codex を含む ChatGPT のプラン(
 ```
 $ python3 ~/.claude/codex-router/bin/router.py now
 pick: codex (reason leftover, main claude)
-  claude-session (4.9h): used 31%  resets 10-13 21:59 (in 3.4 h)  limit $168 (current window)  remaining $116, exhaust probability 0.03
-  claude-weekly_all (7d): used 82%  resets 10-14 14:59 (in 20.4 h)  limit $1,090 (current window)  remaining $196, exhaust probability 0.43
-  claude-weekly_scoped:Fable (5.2d, at least): used 2%  resets 10-14 14:59 (in 20.4 h)  model-scoped window (shown only, not used for the decision)
-  codex-7d: used 5%  resets 10-20 14:04 (in 163.5 h)  limit $245 (history)  remaining $232, exhaust probability 0.39
-  expected leftover Claude $59 / Codex $81  (leftover probability Claude 0.57 / Codex 0.61)  guard none  full none
+  claude-session (5h): used 40%  resets 10-13 21:59 (in 3.4 h)  limit $150 (current window)  remaining $90, exhaust probability 0.05
+  claude-weekly_all (7d): used 70%  resets 10-14 14:59 (in 20.4 h)  limit $1,000 (current window)  remaining $300, exhaust probability 0.30
+  claude-weekly_scoped:Fable (5.2d, at least): used 5%  resets 10-14 14:59 (in 20.4 h)  model-scoped window (shown only, not used for the decision)
+  codex-7d: used 10%  resets 10-20 14:04 (in 163.5 h)  limit $200 (history)  remaining $180, exhaust probability 0.35
+  expected leftover Claude $70 / Codex $90  (leftover probability Claude 0.70 / Codex 0.65)  guard none  full none
 ```
 1 行目が判断(ここでは Codex)です。その下の行は、使用枠ごとの長さ(Claude はかっこ内に記録からの推定を出し、まだ下限しか分からないものは `at least`。Codex は名前が長さです)、今の使用率(`used`)、リセットの時刻(`resets`)、推定した上限の金額(`limit`。かっこは出し方で、`current window` は今の使用枠の料金から、`history` は過去の記録から)、上限までの残りの金額(`remaining`)、使い切る確率(リセットまでに上限に達する確率。`exhaust probability`)です。料金から確率を出せない使用枠は、`remaining` が残りの使用率(%)になり、`(from usage growth)` が付きます(下の「使い切る確率」)。
 最後の行は、Claude・Codex それぞれの契約で使われないまま残ると見込まれる料金(`expected leftover`)、いちばん長い使用枠の使い残す確率(1 − 使い切る確率。かっこ内)と、歯止め・満杯の使用枠です。`guard` は歯止め(上限に達しそうな移譲元を避ける判断)で決めた使用枠、`full` は満杯(使用率が 98% 以上)の使用枠です(下の「判断のしかた」)。読めなかったことや注記があれば、`error:`・`note:` の行が出ます。
@@ -112,9 +112,9 @@ Claude を主に使い、仕事の一部を Codex に任せる人も、その逆
 `now --json` の形(値は例。`windows` は使用枠ごと)：
 ```json
 {"pick": "codex", "main": "claude", "reason": "leftover", "tie": false, "guard": [], "full": [],
- "claude_left_usd": 58.9, "codex_left_usd": 81.44, "claude_L": 0.5725, "codex_L": 0.6125,
- "windows": {"claude-session": {"u": 31.0, "r": 1791896399, "win": 296.9167, "win_known": true, "win_lo": 293.9167, "win_hi": 299.9167,
-                                "scoped": false, "X": 0.03, "limit_usd": 168.2, "limit_src": "now", "rem_h": 3.4, "remain_usd": 116.06}, "...": {}},
+ "claude_left_usd": 70.12, "codex_left_usd": 89.6, "claude_L": 0.7, "codex_L": 0.65,
+ "windows": {"claude-session": {"u": 40.0, "r": 1791896399, "win": 297.5, "win_known": true, "win_lo": 294.5, "win_hi": 300.5,
+                                "scoped": false, "X": 0.05, "limit_usd": 150.0, "limit_src": "now", "rem_h": 3.4, "remain_usd": 90.0}, "...": {}},
  "errors": [], "notes": ["Claude: used the record from 18:35:12 (within 60 s; API not called)"]}
 ```
 - `reason` は次のどれかです：`full`(満杯)・`guard`(歯止め。下の「判断のしかた」の 2)・`tie`(差なし、または使い切る確率の出せる使用枠が無い側があって比べられない)・`leftover`(使い残す料金の比較)・`leftover_prob`(使い残す確率の比較。使い残す料金を出せない側があるとき)・`codex_unreadable`(Codex が読めない)・`claude_unreadable`(Claude が読めない)・`both_unreadable`(どちらも読めない。`tie_default` を返す)。
@@ -235,7 +235,6 @@ codex claude-codex-router: guard (expected leftover Claude $40 / Codex $95); gua
   - 各期間は、その期間を初めて読んだ時刻とその直前の読み取りの時刻のあいだに始まっています。なので長さは「リセット − 初めて読んだ時刻」以上、「リセット − 直前の読み取り」以下です。直前の読み取りには、リセットを過ぎた古い値(別のセッションが書いた終わった期間の値)は数えません。使用率がずっと 0 の期間は根拠にしません(claude-token-pace は使っていないあいだも仮のリセットの時刻を書いていたため)。
   - この幅がその使用枠のふだんの幅(中央値)の 2 倍以下で、長さの半分より狭い期間を「始まりを近く挟めた期間」とします。そのうち新しい 5 期間の中央値(幅の真ん中)を長さとします。長さが変われば、数期間で追います。早く終わった期間が 1 つあっても動きません。
   - 始まりを近く挟めた期間がまだ無い(入れた直後など)あいだと、後の期間がその幅より長かった(長さが延びた)ときは、長さは下限でしかありません(表示に `at least`)。期間を 1 度も読んでいない使用枠は、長さが分からないので判断に使いません。そのあいだは、今の使用枠の料金から上限の金額を出しません(使用枠の始まりが分からないため)。
-  - 手元の記録では(2026-10-14 時点)、`session` は 296.9 分(293.9〜299.9 分)、`weekly_all` は 10079.8 分(10079.5〜10080.0 分)と推定されました。
   モデルを限った使用枠(例：Fable だけを数える 7 日の使用枠)は表示だけで、判断には使いません(その使用枠で作業が止まるかは、そのモデルを使っているかで決まり、このツールには分からないため)。
 - Codex：ChatGPT のサーバーが返すすべての使用枠を、どの欄にあっても読み、判断に使います(長さもサーバーが返します。何に掛かる使用枠かはサーバーが示さないので、欄名で外すことはしません)。使用枠の名前は正確な長さで、日・時間で割り切れればその単位で表します(例 `codex-7d`、`codex-5h`、割り切れなければ `codex-90m`)。同じ長さが 2 つあるときは応答の中の場所も付けます。会話ログの記録と claude-token-pace の記録も、欄の数によらずすべて取り込みます。
 
@@ -254,7 +253,7 @@ codex claude-codex-router: guard (expected leftover Claude $40 / Codex $95); gua
   - x が記録の長さの半分より長いときは、x を記録の半分以下の長さに等分し、その長さの実績をそれぞれ独立に選び直して足します(足した長さが x に合うよう縮めます)。
   - これに、すべての過去の時点の実績を同じ重みで集めた分布を混ぜます。混ぜる割合は 2 ÷ (2 + 記録の長さ ÷ x) です。記録の中に長さ x の実績が少ないあいだは、状態で選ぶと当たりにくいためです(記録が短いとき・x が長いときほど多く混ぜます)。
   - 曜日や休みの日は使いません(どの曜日を休みとも決めず、分けもしません)。ほかの人の記録から学んだ値も使いません。
-  - 使い控えの期間は、そのままでは使いません。どれかの使用枠の使用率が 95% 以上になってからその使用枠のリセットまでは、その使用枠の始まりからそこまでの速さで使い続けたとみなした料金に置き換えます(手元の記録では、使用率 90% までは使う速さが落ちず、95% に達した後は Claude の 5 時間の使用枠で 2 割ほどに落ちていました)。上限が無かったら使った量を予測するためです。
+  - 使い控えの期間は、そのままでは使いません。どれかの使用枠の使用率が 95% 以上になってからその使用枠のリセットまでは、その使用枠の始まりからそこまでの速さで使い続けたとみなした料金に置き換えます。上限が無かったら使った量を予測するためです。
 - **使い切る確率 X**(次のリセットまでに上限に達する確率)＝ P(S ≥ 上限 × (1 − u/100))。**使い残す確率**＝ 1 − X。
 - 記録が短くても、ある分で X を出します。料金の記録が短くて予測が作れないときは X を出しません(注記に `cost records too short for an exhaust probability`)。
 - 料金から X を出せない使用枠は、その使用枠の使用率の増え方から X を出します。料金から出せないのは、その側(Claude か Codex)の料金の記録がこのコンピューターに 1 つも無いとき(例：その側のツール(Claude Code か Codex)を入れたばかりのコンピューター。注記に `no cost records on this machine`)と、上限の金額を出せないとき(使用率か今の使用枠の料金が 0 で、過去の記録からも出せないとき。注記に `limit unknown in cost`)です。
@@ -262,7 +261,7 @@ codex claude-codex-router: guard (expected leftover Claude $40 / Codex $95); gua
   - 使うのは使用率の記録(下の「記録とデータの扱い」の `usage.jsonl`)と、今読んだ値です。期間の中で最初に読んだときの使用率は、期間の始まりからそのときまで均等に増えたとみなします。2 回の読みのあいだの伸びは、後の読みの時点に置きます。1 回も読んでいない期間は、使っていないとみなします。
   - 使用率を 1 回しか読んでいないあいだは、その期間の始まりから均等に増えたとみなした伸びだけが根拠なので、見込みは当たりにくくなります。5 分おきの記録が溜まるにつれて、実際の増え方が入ります。
   - 表示では、`remaining` が上限までの残りの使用率(%)になり、`(from usage growth)` が付きます。
-  手元の記録(1 人分)で試した範囲では、記録が 1 か月に満たないあいだは、記録が長いときより見込みが外れやすくなります。特に、記録の始まりに使い控えがあると、その前の速さで使い続けたとみなす分が大きく、長い先の見込みが大きく出ます。
+  記録が短いあいだは、記録が長いときより見込みが外れやすくなります。特に、記録の始まりに使い控えがあると、その前の速さで使い続けたとみなす分が大きく、長い先の見込みが大きく出ます。
 
 ### 判断のしかた
 

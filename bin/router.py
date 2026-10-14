@@ -32,7 +32,7 @@ Exhaust probability X (probability of reaching the limit before the window's nex
   This is mixed with the distribution of all past outcomes (no state, no recency), whose share is 2 / (2 + n_b), n_b = (records' length) / x: when the
   records hold few outcomes of length x, choosing among them by the state is unreliable.
   Weekdays and days off are not assumed or classified. Nothing is learned from other users' records.
-  Held-back time is not used as it is: from the first read at or above 95% (U_HOLD; in the records the pace did not drop up to 90%) until the reset of that window,
+  Held-back time is not used as it is: from the first read at or above 95% (U_HOLD) until the reset of that window,
   the inputs are replaced by use at the pace from the window start until that read (the use if there were no limit).
   A window with no cost to estimate from (no cost records on this machine for that side, or no limit in cost) gets X from its own usage growth instead:
     the same forecast run on the window's usage growth (in %; the growth seen at the first read of a period is spread evenly back to the period start),
@@ -511,7 +511,7 @@ class CostSeries:
 
 
 # ---- forecast of the use from now (the use if there were no limit) ----
-U_HOLD = 95.0          # from this usage on, use is held back (in the records the pace did not drop up to 90% and fell after 95%). Held-back time in the inputs is replaced
+U_HOLD = 95.0          # from this usage on, use is held back. Held-back time in the inputs is replaced
 HOLD_STEP = 900        # the replaced use is spread every this many seconds
 FC_GRID = 300          # past starts every this many seconds back from now (so that they share the time of day of now)
 FC_HALFLIFE = 14 * 86400.0   # recency: a start this long ago weighs half
