@@ -17,6 +17,7 @@ pass() { echo "ok  : $*"; }
 
 export HOME="$work/home"
 export CLAUDE_CONFIG_DIR="$HOME/.claude"
+export XDG_CONFIG_HOME="$HOME/.config"   # install.sh puts the systemd unit here; keep the real ~/.config untouched
 export CLAUDE_CODEX_ROUTER_DIR="$HOME/.claude/codex-router"
 export CLAUDE_CODEX_ROUTER_SCHEDULER=cron
 export CLAUDE_CODEX_ROUTER_SKILLS=none   # the installer does not ask about the skills (section 11 sets it)
@@ -103,8 +104,10 @@ s.serve_forever()
 EOF
 python3 "$work/server.py" "$work" > "$work/port" &
 server_pid=$!
-for _ in $(seq 50); do [[ -s "$work/port" ]] && break; sleep 0.1; done
-port="$(cat "$work/port")"
+for _ in $(seq 300); do [[ -s "$work/port" ]] && break; sleep 0.1; done
+port="$(cat "$work/port" 2>/dev/null || true)"
+# an empty port makes the URL http://127.0.0.1:/..., which surfaces as a connection refused on port 80 and hides the cause
+[[ "$port" =~ ^[0-9]+$ ]] || fail "the fake usage API server did not start (port: $port)"
 export CLAUDE_CODEX_ROUTER_CLAUDE_URL="http://127.0.0.1:$port/api/oauth/usage"
 export CLAUDE_CODEX_ROUTER_CODEX_URL="http://127.0.0.1:$port/backend-api/wham/usage"
 mkdir -p "$HOME/.codex"
@@ -266,7 +269,7 @@ EOF
 chmod +x "$work/bin/loginctl" "$work/bin/systemctl"
 CLAUDE_CODEX_ROUTER_SCHEDULER=systemd bash "$SRC/install.sh" > "$work/install-systemd.log" || fail "install stops when systemd is unreachable"
 [[ -f "$DIR/.version" && -f "$DIR/uninstall.sh" ]] || fail "when systemd is unreachable, install does not finish"
-grep -q '^enable-linger ' "$work/loginctl.log" && [[ -f "$DIR/.linger" ]] || fail "linger not enabled / no marker"
+if ! grep -q '^enable-linger ' "$work/loginctl.log" || [[ ! -f "$DIR/.linger" ]]; then fail "linger not enabled / no marker"; fi
 grep -q 'timer could not be registered' "$work/install-systemd.log" || fail "does not report that the timer could not be registered"
 [[ -f "$HOME/.config/systemd/user/claude-codex-router-sample.timer" ]] || fail "no timer definition"
 : > "$work/systemd-up"
@@ -277,7 +280,7 @@ grep -q "^Environment=TOKEN_PACE_DIR=$HOME/tp$" "$HOME/.config/systemd/user/clau
 grep -q '^enable-linger ' "$work/loginctl.log" && fail "enabled linger again although it was already enabled"
 grep -q 'enable --now claude-codex-router-sample.timer' "$work/systemctl.log" || fail "the timer is not enabled"
 bash "$DIR/uninstall.sh" > /dev/null
-grep -q '^disable-linger ' "$work/loginctl.log" && [[ ! -f "$DIR/.linger" ]] || fail "uninstall did not revert linger"
+if ! grep -q '^disable-linger ' "$work/loginctl.log" || [[ -f "$DIR/.linger" ]]; then fail "uninstall did not revert linger"; fi
 [[ ! -f "$HOME/.config/systemd/user/claude-codex-router-sample.timer" ]] || fail "the timer definition remains after uninstall"
 pass "systemd: enables linger, finishes installing even when systemd is unreachable, reverted by uninstall"
 
@@ -286,7 +289,7 @@ bash "$SRC/install.sh" > /dev/null
 python3 "$DIR/bin/router.py" sample > /dev/null || true
 bash "$SRC/install.sh" > "$work/install-w.log"
 grep -q '^  weights: weights kept$' "$work/install-w.log" || fail "install did not check the weights ($(grep weights "$work/install-w.log"))"
-touch -d '-2 hours' "$DIR/data/last-sample"
+python3 -c 'import os, sys, time; t = time.time() - 7200; os.utime(sys.argv[1], (t, t))' "$DIR/data/last-sample"
 out=$(python3 "$DIR/bin/router.py" now --json) || true
 python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert any("stopped" in n for n in d["notes"]), d["notes"]' "$out" || fail "does not report that periodic sampling has stopped"
 python3 "$DIR/bin/router.py" sample > /dev/null || true

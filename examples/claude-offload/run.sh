@@ -31,7 +31,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ISGIT=0; git -C "$CWD" rev-parse --is-inside-work-tree >/dev/null 2>&1 && ISGIT=1
 [ $ISGIT = 1 ] && git -C "$CWD" status --porcelain > "$OUT/status.before"
 START=$(date +%s)
-(cd "$CWD" && claude -p --output-format json "${PERM[@]}" "${EXTRA[@]}" < "$OUT/prompt.md") > "$OUT/result.json" 2> "$OUT/stderr.txt"
+(cd "$CWD" && claude -p --output-format json "${PERM[@]}" "${EXTRA[@]+"${EXTRA[@]}"}" < "$OUT/prompt.md") > "$OUT/result.json" 2> "$OUT/stderr.txt"
 RC=$?
 # last.txt = the final message; is_error / api_error_status tell whether Claude Code could not answer
 ERR="$(python3 - "$OUT/result.json" "$OUT/last.txt" <<'PY'
