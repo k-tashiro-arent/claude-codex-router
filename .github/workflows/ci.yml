@@ -60,3 +60,28 @@ jobs:
           SMOKE_INSTALL_MODE: ${{ matrix.mode }}
           SMOKE_BOOTSTRAP_REF: citest
         run: bash test/smoke.sh
+
+  # macOS still ships bash 3.2 as /bin/bash. The runner has Homebrew bash (5.x) first on PATH,
+  # so faults that only happen on 3.2 (an empty "${ARR[@]}" being unbound under set -u) are never hit.
+  # Point PATH's bash at the system one before running the smoke test.
+  smoke-system-bash:
+    name: smoke (macos-latest / system bash 3.2)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: put the system bash first on PATH
+        run: |
+          mkdir -p "$RUNNER_TEMP/sysbash"
+          ln -s /bin/bash "$RUNNER_TEMP/sysbash/bash"
+          echo "$RUNNER_TEMP/sysbash" >> "$GITHUB_PATH"
+      - name: show the bash version in use
+        run: |
+          command -v bash
+          bash --version | head -1
+          bash -c 'test "${BASH_VERSINFO[0]}" -eq 3' || { echo "not bash 3.x; this job would not test anything"; exit 1; }
+      - name: run smoke test
+        env:
+          SMOKE_INSTALL_MODE: direct
+        run: bash test/smoke.sh

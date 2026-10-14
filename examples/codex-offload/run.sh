@@ -21,7 +21,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ISGIT=0; git -C "$CWD" rev-parse --is-inside-work-tree >/dev/null 2>&1 && ISGIT=1
 [ $ISGIT = 1 ] && git -C "$CWD" status --porcelain > "$OUT/status.before"
 START=$(date +%s)
-codex exec --skip-git-repo-check --color never --json -s "$SB" -C "$CWD" "${EXTRA[@]}" -o "$OUT/last.txt" - \
+codex exec --skip-git-repo-check --color never --json -s "$SB" -C "$CWD" "${EXTRA[@]+"${EXTRA[@]}"}" -o "$OUT/last.txt" - \
   < "$OUT/prompt.md" > "$OUT/events.jsonl" 2> "$OUT/stderr.txt"
 RC=$?
 {

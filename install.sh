@@ -191,7 +191,7 @@ for d, dirs, files in sorted(os.walk(sys.argv[1])):
 print(h.hexdigest())
 PY
 }
-recorded_hash() { [[ -f "$SKILLS_FILE" ]] && awk -v p="$1" '$1 == p {print $2}' "$SKILLS_FILE" || true; }
+recorded_hash() { if [[ -f "$SKILLS_FILE" ]]; then awk -v p="$1" '$1 == p {print $2}' "$SKILLS_FILE" || true; fi; }
 record_hash() {
   { [[ -f "$SKILLS_FILE" ]] && awk -v p="$1" '$1 != p' "$SKILLS_FILE"; printf '%s %s\n' "$1" "$2"; } > "$SKILLS_FILE.tmp"
   mv "$SKILLS_FILE.tmp" "$SKILLS_FILE"
