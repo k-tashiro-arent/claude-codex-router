@@ -224,7 +224,9 @@ install_skill() {  # install_skill <src dir> <dst dir> <skills dir under ~ writt
       return 1
     elif [[ -z "$rec" ]]; then
       if [[ "${CLAUDE_CODEX_ROUTER_SKILLS_REPLACE:-}" == yes ]] || { [[ -z "${CLAUDE_CODEX_ROUTER_SKILLS_REPLACE:-}" ]] && ask_yes "$dst already exists. Replace it (the old one is moved aside)?"; }; then
-        bak="$dst.bak-$(date +%Y%m%d%H%M%S)"
+        # outside the skills dir: a copy left there would be loaded as a second skill of the same name
+        bak="$DIR/skill-backups/$(basename "$dst")-$(date +%Y%m%d%H%M%S)"
+        mkdir -p "$DIR/skill-backups"
         mv "$dst" "$bak"
         echo "  skill  : moved the existing $dst to $bak"
       else

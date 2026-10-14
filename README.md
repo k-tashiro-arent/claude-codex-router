@@ -87,7 +87,7 @@ cd claude-codex-router
 ```bash
 bash ~/.claude/codex-router/uninstall.sh
 ```
-タイマーと `router.py` を外します。linger を有効にしたのがインストーラなら無効に戻し、前から有効だったときは触りません。記録と設定(`data/` と `config.json`)は残します(完全に消すには `rm -rf ~/.claude/codex-router`)。置き場を変えていたときは、同じ `CLAUDE_CODEX_ROUTER_DIR` を付けて実行します。インストールのときに `XDG_CONFIG_HOME`(systemd のタイマーの置き場)・`CODEX_HOME`(Codex の規則の置き場)を変えていたときも、同じ値を付けて実行します。
+タイマーと `router.py` を外します。linger を有効にしたのがインストーラなら無効に戻し、前から有効だったときは触りません。記録と設定(`data/` と `config.json`)と、置き換えたときに移したスキル(`skill-backups/`)は残します(完全に消すには `rm -rf ~/.claude/codex-router`)。置き場を変えていたときは、同じ `CLAUDE_CODEX_ROUTER_DIR` を付けて実行します。インストールのときに `XDG_CONFIG_HOME`(systemd のタイマーの置き場)・`CODEX_HOME`(Codex の規則の置き場)を変えていたときも、同じ値を付けて実行します。
 インストーラが入れた移譲のスキルと Codex の規則も外します。入れたあとに書き換えたスキルは残して知らせるので、要らなければ自分で消してください。`CLAUDE.md`・`AGENTS.md` に書いた行と、手で写したスキルも自分で消します(残すと `pick.sh` がいつも `codex` を返します)。
 
 ## 使い方
@@ -154,7 +154,7 @@ codex claude-codex-router: guard (expected leftover Claude $40 / Codex $95); gua
 ### 入れ方
 
 インストーラ(`install.sh`)が、スキルごとに入れるかを聞きます。聞かずに決めるには `CLAUDE_CODEX_ROUTER_SKILLS=claude|codex|both|none` を付けます(`claude` は `codex-offload`、`codex` は `claude-offload`)。方法 A(`curl … | bash`)でも、答えは端末から読みます。端末が無いとき(CI など)は、聞かずに入れません。前にインストーラが入れたスキルは、`none` を付けても更新します(外すにはアンインストールします)。
-- 同じ名前のスキルがすでにあれば、置き換えるかを聞きます(`CLAUDE_CODEX_ROUTER_SKILLS_REPLACE=yes|no` でも決められます)。置き換えるときは、元のものを `<置き場>.bak-<日時>` に移します。
+- 同じ名前のスキルがすでにあれば、置き換えるかを聞きます(`CLAUDE_CODEX_ROUTER_SKILLS_REPLACE=yes|no` でも決められます)。置き換えるときは、元のものを `~/.claude/codex-router/skill-backups/<スキル名>-<日時>/` に移します(スキルの置き場の中に残すと、同じ名前のスキルがもう 1 つあるとして読まれるためです)。
 - インストーラが入れたスキルは、更新・再インストールのときに新しい版に入れ替えます。入れたあとに書き換えたスキルは、入れ替えずに残して知らせます。
 - `SKILL.md` の中のパスは、入れた場所の絶対パスに書き換えます。
 - `claude-offload` を入れると、Codex の規則 `~/.codex/rules/claude-codex-router.rules`(`CODEX_HOME` を変えていればその下)も書きます。Codex のサンドボックスの中では、ネットワークと `~/.claude` が使えず、判定器も Claude Code も動かないためです。この規則は、このスキルの `pick.sh` と `run.sh` の 2 つだけを、聞かずにサンドボックスの外で動かすことを許します。規則を読み込むには Codex を起動し直します。
