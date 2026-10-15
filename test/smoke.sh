@@ -18,7 +18,7 @@ pass() { echo "ok  : $*"; }
 export HOME="$work/home"
 export CLAUDE_CONFIG_DIR="$HOME/.claude"
 export XDG_CONFIG_HOME="$HOME/.config"   # install.sh puts the systemd unit here; keep the real ~/.config untouched
-export CLAUDE_CODEX_ROUTER_DIR="$HOME/.claude/codex-router"
+export CLAUDE_CODEX_ROUTER_DIR="$HOME/.claude-codex-router"
 export CLAUDE_CODEX_ROUTER_SCHEDULER=cron
 export CLAUDE_CODEX_ROUTER_SKILLS=none   # the installer does not ask about the skills (section 11 sets it)
 mkdir -p "$HOME/.claude" "$work/bin"
@@ -128,6 +128,9 @@ for f in bin/router.py config.json uninstall.sh .version; do
   [[ -f "$DIR/$f" ]] || fail "$f missing after install"
 done
 [[ "$(grep -c '# claude-codex-router$' "$work/crontab.txt")" == 1 ]] || fail "the crontab line is not exactly 1 line"
+grep -q '^Check: OK (read both Claude and Codex)$' "$work/install.log" || fail "the installer did not decide once as a check ($(tail -3 "$work/install.log"))"
+grep -q '^pick: ' "$work/install.log" || fail "the installer did not show the decision"
+[[ -s "$DIR/data/cost-state.json" ]] || fail "the installer's decision did not read the conversation logs"
 grep -q "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR " "$work/crontab.txt" || fail "the crontab line has no CLAUDE_CONFIG_DIR"
 pass "install ($MODE): files and crontab line"
 
@@ -139,6 +142,7 @@ grep -q '0.7' "$DIR/config.json" || fail "reinstall overwrote config.json"
 pass "reinstall: keeps the settings, timers do not stack"
 
 # 3) both readable: decides and records
+n_install=$(wc -l < "$DIR/data/usage.jsonl")   # the installer's decisions (install and reinstall) recorded too
 set +e
 out=$(python3 "$DIR/bin/router.py" now --json); code=$?
 set -e
@@ -150,18 +154,18 @@ w = d['windows']
 assert d['pick'] in ('claude', 'codex') and d['main'] == 'claude', d
 assert set(w) == {'claude-session', 'claude-weekly_all', 'claude-weekly_scoped:Fable', 'codex-7d'}, w.keys()
 assert w['codex-7d']['u'] == 30 and w['claude-weekly_all']['u'] == 20 and w['codex-7d']['win'] == 10080
-# Claude's API gives no length: on the first read it is only a lower bound (until the reset), estimated from the reads
-assert w['claude-session']['win_known'] is False and w['claude-session']['win'] <= 300, w['claude-session']
+# Claude's limits give no length: it is the one the name of the object with the same reset states (five_hour, seven_day), known on the first read
+assert (w['claude-session']['win_known'], w['claude-session']['win'], w['claude-weekly_all']['win']) == (True, 300, 10080), w
 assert w['claude-weekly_scoped:Fable']['scoped'] and not w['claude-weekly_all']['scoped']
 # there are conversation logs, but the cost in the current windows is still 0 (no limit in cost): X comes from usage growth
 assert all(v['basis'] == 'usage' for k, v in w.items() if not v['scoped']) and w['codex-7d']['X'] is not None, w
-# Claude: the length is only a lower bound on the first read, so its usage growth gives no X yet (claude_L null: nothing to compare)
+# Claude: its usage growth on the first read gives an X or none (claude_L null: nothing to compare)
 assert (d['claude_L'] is None or 0 <= d['claude_L'] <= 1) and 0 <= d['codex_L'] <= 1 and not d['errors'] and 'sub_tight' not in d and d['full'] == []
 # no limit in cost, so the expected leftover in cost is unknown and the comparison uses the leftover probability
 assert d['claude_left_usd'] is None and d['codex_left_usd'] is None and d['reason'] in ('leftover_prob', 'tie', 'guard'), d
 assert 'limit unknown in cost' in w['codex-7d']['note'], w['codex-7d']
 EOF
-[[ "$(wc -l < "$DIR/data/usage.jsonl")" -eq 4 ]] || fail "the records are not 4 lines"
+[[ "$(wc -l < "$DIR/data/usage.jsonl")" -eq $((n_install + 4)) ]] || fail "now did not add 4 lines to the records"
 out=$(python3 "$DIR/bin/router.py" now --json --main codex) || true
 python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["main"]=="codex", d' "$out" || fail "--main codex"
 python3 "$DIR/bin/router.py" now > /dev/null || fail "now (human-readable output)"
@@ -171,8 +175,22 @@ pass "now: read both, decided, and recorded"
 set +e
 out=$(CODEX_HOME="$work/no-codex" python3 "$DIR/bin/router.py" now --json); code=$?
 set -e
-if [[ $code != 1 ]] || ! python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["pick"]=="claude" and d["reason"]=="codex_unreadable" and d["errors"]' "$out"; then
-  fail "when Codex is unreadable (exit code $code, $out)"
+if [[ $code != 1 ]] || ! python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["pick"]=="claude" and d["reason"]=="codex_not_logged_in" and d["errors"]' "$out"; then
+  fail "when Codex is not logged in (exit code $code, $out)"
+fi
+mkdir -p "$work/bad-codex"
+printf '{"tokens": {"access_token": "codex-token"}}\n' > "$work/bad-codex/auth.json"
+set +e
+out=$(CODEX_HOME="$work/bad-codex" CLAUDE_CODEX_ROUTER_CODEX_URL="http://127.0.0.1:1/x" python3 "$DIR/bin/router.py" now --json); code=$?
+set -e
+if [[ $code != 1 ]] || ! python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["pick"]=="claude" and d["reason"]=="codex_unreadable" and d["errors"] and d["login"]=={}' "$out"; then
+  fail "when Codex is logged in but unreadable (exit code $code, $out)"
+fi
+set +e
+out=$(CODEX_HOME="$work/bad-codex" python3 "$DIR/bin/router.py" now --json); code=$?   # the fake service rejects this login (no account id)
+set -e
+if [[ $code != 1 ]] || ! python3 -c 'import json,sys; d=json.loads(sys.argv[1]); v=d["login"]["codex"]; assert d["reason"]=="codex_unreadable" and v["state"]=="login_rejected" and v["http"]==401 and "codex login" in v["action"] and v["last_read"]' "$out"; then
+  fail "when the service rejects the Codex login, it is said with what to do (exit code $code, $out)"
 fi
 mv "$CLAUDE_CONFIG_DIR/.credentials.json" "$work/cred.bak"
 set +e
@@ -181,7 +199,29 @@ set -e
 if [[ $code != 2 ]] || ! python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["pick"]=="codex" and d["reason"]=="both_unreadable" and len(d["errors"])==2' "$out"; then
   fail "when neither is readable (exit code $code, $out)"
 fi
+set +e
+out=$(CODEX_HOME="$work/bad-codex" CLAUDE_CODEX_ROUTER_CODEX_URL="http://127.0.0.1:1/x" python3 "$DIR/bin/router.py" now --json); code=$?
+set -e
+if [[ $code != 2 ]] || ! python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["pick"]=="codex" and d["reason"]=="both_unreadable"' "$out"; then
+  fail "when neither is readable, the side logged in is picked (exit code $code, $out)"
+fi
+set +e
+python3 "$DIR/bin/router.py" now --main nobody > /dev/null 2>&1; c1=$?
+python3 "$DIR/bin/router.py" no-such-command > /dev/null 2>&1; c2=$?
+set -e
+[[ $c1 == 64 && $c2 == 64 ]] || fail "a wrong argument or an unknown command does not exit with 64 ($c1, $c2)"
+touch "$work/not-a-dir"
+set +e
+CLAUDE_CODEX_ROUTER_DIR="$work/not-a-dir" python3 "$DIR/bin/router.py" now --json > /dev/null 2>&1; c3=$?
+set -e
+[[ $c3 == 70 ]] || fail "an unexpected error does not exit with 70 ($c3)"
 mv "$work/cred.bak" "$CLAUDE_CONFIG_DIR/.credentials.json"
+set +e
+out=$(CODEX_HOME="$work/no-codex" CLAUDE_CODEX_ROUTER_CLAUDE_URL="http://127.0.0.1:1/x" python3 "$DIR/bin/router.py" now --json); code=$?
+set -e
+if [[ $code != 2 ]] || ! python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["pick"]=="claude" and d["reason"]=="both_unreadable"' "$out"; then
+  fail "when neither is readable and only Claude is logged in, Claude is picked over tie_default (exit code $code, $out)"
+fi
 pass "does not stop when a side is unreadable, and reports it in the exit code"
 
 # 5) sample (what the timer calls)
@@ -190,6 +230,7 @@ python3 "$DIR/bin/router.py" sample > /dev/null || fail "sample"
 [[ "$(wc -l < "$DIR/data/usage.jsonl")" -eq $((n0 + 4)) ]] || fail "sample does not add 4 lines"
 [[ "$(wc -l < "$DIR/data/cost-claude.jsonl")" -eq 1 && "$(wc -l < "$DIR/data/cost-codex.jsonl")" -eq 1 ]] || fail "sample does not add cost records from the conversation logs"
 [[ -f "$DIR/data/litellm-prices.json" ]] || fail "sample does not create the price data cache"
+python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); assert "windows" in d' "$DIR/data/forecast.json" || fail "sample does not write the forecast"
 python3 "$DIR/bin/router.py" sample > /dev/null || fail "second sample"
 [[ "$(wc -l < "$DIR/data/cost-claude.jsonl")" -eq 1 ]] || fail "second sample duplicated cost records"
 pass "sample: added usage and cost to the records (cost not duplicated)"

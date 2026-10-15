@@ -5,7 +5,7 @@
 #   The usage records (data/) and settings (config.json) are kept (to delete everything, do it by hand as the final message says).
 set -u
 
-DIR="${CLAUDE_CODEX_ROUTER_DIR:-$HOME/.claude/codex-router}"
+DIR="${CLAUDE_CODEX_ROUTER_DIR:-$HOME/.claude-codex-router}"
 NAME="claude-codex-router"
 LABEL="io.github.k-tashiro-arent.claude-codex-router"
 

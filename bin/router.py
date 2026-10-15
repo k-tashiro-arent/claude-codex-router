@@ -4,7 +4,8 @@
 Main side and sub side: the side used mainly is set by --main claude|codex (or main in config, default claude). The other side is the sub side.
 
 Windows: every window the API returns is handled (their number, length and limit are assumed to change).
-  Claude: each window in limits of the usage API (every kind). The API gives no length: it is estimated from the reads (estimate_length: the median,
+  Claude: each window in limits of the usage API (every kind). The length is the one the name with the same reset states (five_hour, seven_day;
+          name_length). When the name states none, or the reads disagree with it, it is estimated from the reads (estimate_length: the median,
           over the latest periods whose start lies closely between two reads, of the reset minus the middle of those reads); until some period's
           start has been read closely, only a lower bound (the largest reset minus the period's first read).
           Model-scoped windows (windows with a scope) are shown only, not used for the decision.
@@ -57,7 +58,7 @@ Usage records (each environment accumulates its own):
   <DIR>/data/usage.jsonl. 1 line = 1 read of 1 window {"ts", "side", "id": window kind, "win": window length (min; the API gives it for Codex only, lines of earlier versions have it for Claude too), "u": usage, "r": reset time,
   "scoped": whether the window is model-scoped, "src"}. Lines without id: Codex by the length; Claude (imported or from earlier versions) joined to
   the kind with the same reset times.
-  DIR is the environment variable CLAUDE_CODEX_ROUTER_DIR (default ~/.claude/codex-router).
+  DIR is the environment variable CLAUDE_CODEX_ROUTER_DIR (default ~/.claude-codex-router).
   How they are read (neither calls a model, so the windows are not used up):
     Claude: GET https://api.anthropic.com/api/oauth/usage (same as /usage in Claude Code; not publicly documented).
             The token is only read from $CLAUDE_CONFIG_DIR (default ~/.claude)/.credentials.json and never refreshed.
@@ -67,6 +68,7 @@ Usage records (each environment accumulates its own):
 
 Usage:
   router.py now [--json] [--main claude|codex]   decide now (reads both and also adds them to the records). Exit code 0=both read 1=one side only 2=neither read
+                                                 64=wrong argument or unknown command 70=stopped by an unexpected error
   router.py sample      reads both and adds them to the records; adds cost records from the conversation logs (the timer install.sh sets up calls it every 5 minutes)
 """
 import bisect
@@ -75,6 +77,7 @@ import json
 import math
 import os
 import random
+import re
 import sys
 import time
 
@@ -84,18 +87,19 @@ usage:
   router.py now [--json] [--main claude|codex]  decide now (reads both, also records). exit 0=both read 1=one side 2=neither
   router.py sample      read both and record; add cost rows from the conversation logs (the timer calls this every 5 min)
 
-now --json fields: pick, main, reason (full|guard|tie|leftover|leftover_prob|codex_unreadable|claude_unreadable|both_unreadable), tie,
+now --json fields: pick, main, reason (full|guard|tie|leftover|leftover_prob|codex_unreadable|claude_unreadable|codex_not_logged_in|claude_not_logged_in|both_unreadable), tie,
   guard (main-side windows over guard_risk, when they sent the pick to the sub side), full (all windows at full, not model-scoped),
-  claude_left_usd, codex_left_usd (expected leftover $ of each contract), claude_L, codex_L (leftover probability), windows, errors, notes. Data and settings: $CLAUDE_CODEX_ROUTER_DIR (default ~/.claude/codex-router)."""
+  claude_left_usd, codex_left_usd (expected leftover $ of each contract), claude_L, codex_L (leftover probability), windows, errors, notes. Data and settings: $CLAUDE_CODEX_ROUTER_DIR (default ~/.claude-codex-router)."""
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_DEFAULTS = os.path.join(os.path.dirname(HERE), 'defaults')   # when run directly from the repository
-DIR = os.path.expanduser(os.environ.get('CLAUDE_CODEX_ROUTER_DIR') or '~/.claude/codex-router')
+DIR = os.path.expanduser(os.environ.get('CLAUDE_CODEX_ROUTER_DIR') or '~/.claude-codex-router')
 DATA = os.path.join(DIR, 'data')
 USAGE_LOG = os.path.join(DATA, 'usage.jsonl')
 COST_LOG = {'claude': os.path.join(DATA, 'cost-claude.jsonl'), 'codex': os.path.join(DATA, 'cost-codex.jsonl')}
 COST_STATE = os.path.join(DATA, 'cost-state.json')
 PRICE_FILE = os.path.join(DATA, 'litellm-prices.json')
+FORECAST_FILE = os.path.join(DATA, 'forecast.json')   # forecast paths of every forecast window, written by sample
 SAMPLE_STAMP = os.path.join(DATA, 'last-sample')   # when sample last ran (to check that periodic sampling has not stopped)
 VERSION_FILE = os.path.join(DIR, '.version')       # stands in for the install time (when sample has never run yet)
 TP = os.path.expanduser(os.environ.get('TOKEN_PACE_DIR') or '~/.claude/token-pace') + '/'   # claude-token-pace records (added to the usage records if found)
@@ -855,6 +859,7 @@ class Series:
         self.side, self.id, self.win_min, self.win, self.scoped, self.known = side, wid, win_min, win_min * 60, scoped, known
         self.lo, self.hi = (win_min, win_min) if lo is None else (lo, hi)    # the length is in [lo, hi] (min; hi inf: only a lower bound)
         self.contiguous = contiguous    # whether each period starts at the previous reset (True), later (False), or not known (None)
+        self.len_note = None            # set when the length the name states disagrees with the reads (load_series)
         self.name = f'{side}-{wid}'
         # drop values (t >= r) from old sessions that keep reporting a period already reset. A new period starts at the first read after the previous
         # period's reset (periods_of); the reset may drift between the reads of one period (the latest is kept)
@@ -943,8 +948,10 @@ def estimate_length(reads):
 
 
 def load_series(side, rows=None, until=None):
-    """{window kind: Series}. Length: what the API gave (Codex; the latest), else estimate_length from the reads (Claude)."""
-    by, reads, meta = {}, {}, {}
+    """{window kind: Series}. Length: what the API gave (Codex; the latest), else (Claude) the length the window's name states (nwin, the latest) when
+    the reads agree with it (it is within the length estimate_length gives, or at or above its lower bound) or give none, else estimate_length from the reads
+    (the name kept while the length changed; Series.len_note says so)."""
+    by, reads, meta, named = {}, {}, {}, {}
     for x in rows if rows is not None else read_log():
         if x.get('side') != side or (until is not None and x['ts'] > until):
             continue
@@ -952,6 +959,8 @@ def load_series(side, rows=None, until=None):
         reads.setdefault(k, []).append((x['ts'], x.get('r'), float(x['u']) if x.get('u') is not None else None))
         if side == 'codex' and x.get('win'):
             meta[k] = int(x['win'])
+        if side == 'claude' and x.get('nwin'):
+            named[k] = (x['ts'], float(x['nwin'])) if k not in named or x['ts'] >= named[k][0] else named[k]
         if x.get('r'):
             by.setdefault(k, []).append((x['ts'], float(x['u']), x['r'], bool(x.get('scoped'))))
     if side == 'claude':
@@ -963,10 +972,16 @@ def load_series(side, rows=None, until=None):
     for k, smp in by.items():
         smp.sort()
         e = estimate_length(reads[k])
+        nw = named[k][1] if k in named else None
         if k in meta:   # the length the API gave; periods for the contiguity only
             out[k] = Series(side, k, meta[k], [v[:3] for v in smp], smp[-1][3], True, contiguous=e and e['contiguous'])
+        elif nw and (not e or e['lo'] - 1e-9 <= nw <= e['hi'] + 1e-9):   # the length the name states, the reads agreeing
+            out[k] = Series(side, k, nw, [v[:3] for v in smp], smp[-1][3], True, contiguous=e and e['contiguous'])
         elif e:
             out[k] = Series(side, k, e['len'], [v[:3] for v in smp], smp[-1][3], e['known'], e['lo'], e['hi'], e['contiguous'])
+            if nw:
+                out[k].len_note = (f'{side}-{k}: the name states {win_label(nw)}, but the reads give '
+                                   + (f'{e["lo"]:.0f}-{e["hi"]:.0f} min' if e['known'] else f'at least {e["lo"]:.0f} min') + '; the reads are used')
     return out
 
 
@@ -980,7 +995,7 @@ def record(rows, src='live'):
     with open(USAGE_LOG, 'a') as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         for x in rows:
-            f.write(json.dumps({'ts': int(x.get('ts') or time.time()), 'side': x['side'], **{k: x[k] for k in ('id', 'tp', 'win', 'place') if x.get(k)},
+            f.write(json.dumps({'ts': int(x.get('ts') or time.time()), 'side': x['side'], **{k: x[k] for k in ('id', 'tp', 'win', 'nwin', 'place') if x.get(k)},
                                 'u': x['u'], 'r': x['r'], **({'scoped': True} if x.get('scoped') else {}), 'src': x.get('src', src)}) + '\n')
 
 
@@ -1100,9 +1115,10 @@ def contract_leftover(wins, paths, t):
     return tot / len(paths)
 
 
-def window_states(rows, t, log=None, n=N_SAMP):
+def window_states(rows, t, log=None, n=N_SAMP, aux=None):
     """From the current reads rows, the state of each window {name: {...}} (per side), notes, and the expected leftover ($) of each side's contract
-    (contract_leftover; None when some window of the side has no limit in cost or its forecast is missing)."""
+    (contract_leftover; None when some window of the side has no limit in cost or its forecast is missing).
+    aux (a dict, optional) receives the forecast inputs: aux[side] = {'cost': the cost events used, 'usage': {window name: the usage events used}}."""
     log = read_log() if log is None else log
     notes = []
     out = {'claude': {}, 'codex': {}}
@@ -1120,6 +1136,9 @@ def window_states(rows, t, log=None, n=N_SAMP):
         cur = [{**x, 'ts': x.get('ts') or int(t)} for x in rs if not x.get('cached')]   # the current reads count for the length too
         sers = load_series(side, log + cur)
         held = held_back(sers.values(), t)
+        ev_in = unheld([e for e in ev if e[0] < t], held)
+        if aux is not None:
+            aux[side] = {'cost': ev_in, 'usage': {}}
         need, need_u = [], []
         for x in rs:
             name = f'{side}-{row_id(x)}'
@@ -1127,7 +1146,9 @@ def window_states(rows, t, log=None, n=N_SAMP):
             if side == 'codex' and x.get('win'):
                 win, known, lo, hi = int(x['win']), True, int(x['win']), int(x['win'])   # the length the API gave (Codex)
             elif ser:
-                win, known, lo, hi = ser.win_min, ser.known, ser.lo, ser.hi   # estimated from the reads (Claude: the API gives no length)
+                win, known, lo, hi = ser.win_min, ser.known, ser.lo, ser.hi   # Claude: from the name, or estimated from the reads (load_series)
+                if ser.len_note:
+                    notes.append(ser.len_note)
             else:
                 out[side][name] = {'u': float(x['u']), 'r': x.get('r'), 'win': None, 'scoped': bool(x.get('scoped')), 'X': None, 'limit_usd': None,
                                    'limit_src': None, 'rem_h': None, 'note': 'length unknown (no period has been read yet), not used'}
@@ -1162,7 +1183,7 @@ def window_states(rows, t, log=None, n=N_SAMP):
                 need.append((st, r - t, L * (1 - u / 100)))
         if need:
             xs = sorted({xx for _, xx, _ in need})
-            smp = dict(zip(xs, forecast(unheld([e for e in ev if e[0] < t], held), t, xs, n=n)))
+            smp = dict(zip(xs, forecast(ev_in, t, xs, n=n)))
             for st, xx, m in need:
                 s = smp[xx]
                 st['remain_usd'] = m
@@ -1174,13 +1195,15 @@ def window_states(rows, t, log=None, n=N_SAMP):
                 wins = [{'m': m, 'L': st['limit_usd'], 'r': st['r'], 'len': st['win'], 'lo': st['win_lo'],
                          'hi': st['win_hi'] if st['win_hi'] is not None else math.inf} for st, _, m in need]
                 pts = leftover_points(wins, t)
-                paths = forecast_paths(unheld([e for e in ev if e[0] < t], held), t, [p - t for p in pts], n=n)
+                paths = forecast_paths(ev_in, t, [p - t for p in pts], n=n)
                 left[side] = contract_leftover(wins, paths, t)
         # windows with no cost to estimate from: the same forecast on the window's own usage growth (limit 100%). The current read is included even if not yet recorded
         for st, x in need_u:
             ser = load_series(side, log + [{**x, 'ts': x.get('ts') or int(t), 'r': st['r'], 'u': st['u'], 'win': st['win'] if side == 'codex' else None}]).get(row_id(x))
-            ue = [(min(a, t - 1), v) for a, v in usage_events(ser, t)]      # growth seen at the read now happened before now
-            s = forecast(unheld(ue, held), t, [st['r'] - t], n=n)[0]
+            ue = unheld([(min(a, t - 1), v) for a, v in usage_events(ser, t)], held)      # growth seen at the read now happened before now
+            if aux is not None:
+                aux[side]['usage'][f'{side}-{row_id(x)}'] = ue
+            s = forecast(ue, t, [st['r'] - t], n=n)[0]
             st['basis'], st['remain_pct'] = 'usage', 100.0 - st['u']
             if s:
                 st['X'] = sum(1 for v in s if v >= st['remain_pct']) / len(s)
@@ -1228,16 +1251,18 @@ def decide_states(states, main=MAIN, guard=GUARD_RISK, default=TIE_DEFAULT, left
     return ('claude' if a > b else 'codex'), dict(why, stage=stage)
 
 
-def decide_one_side(states, main=MAIN, guard=GUARD_RISK):
-    """Only one side was read. Returns (chosen side, reason, guard windows). The readable side, except: when it is the main side and some window of it is
-    over guard, the sub side (if the sub side is at its limit, work returns to the main side, so its unknown state does not stop the work)."""
+def decide_one_side(states, main=MAIN, guard=GUARD_RISK, other_logged_in=True):
+    """Only one side was read. Returns (chosen side, reason, guard windows). The readable side, except: when it is the main side, some window of it is
+    over guard and the other side is logged in, the sub side (if the sub side is at its limit, work returns to the main side, so its unknown state does
+    not stop the work). A side that is not logged in (no plan login on this machine) is never chosen: work cannot be handed to it.
+    reason: guard, <other>_unreadable (logged in, but not read now), or <other>_not_logged_in."""
     side = 'claude' if states.get('claude') else 'codex'
     other = 'codex' if side == 'claude' else 'claude'
-    if side == main:
+    if side == main and other_logged_in:
         over = [k for k, v in states[side].items() if not v.get('scoped') and v['X'] is not None and v['X'] > guard]
         if over:
             return other, 'guard', over
-    return side, f'{other}_unreadable', []
+    return side, f'{other}_unreadable' if other_logged_in else f'{other}_not_logged_in', []
 
 
 # ---- read the current values directly (neither calls a model) ----
@@ -1252,18 +1277,69 @@ def claude_credentials():
                            capture_output=True, text=True, timeout=10)
         if p.returncode == 0 and p.stdout.strip():
             return json.loads(p.stdout)['claudeAiOauth']
-    raise RuntimeError(f'no Claude Code credentials ({f})')
+    raise NotLoggedIn(f'no Claude Code credentials ({f})')
+
+
+class NotLoggedIn(RuntimeError):
+    """The side has no plan login on this machine (work cannot be handed to it either)."""
 
 
 class RateLimited(RuntimeError):
     pass
 
 
+class TokenExpired(RuntimeError):
+    """The login's access token has expired and has not been renewed since (the tool renews it when it runs; it is never renewed here)."""
+
+    def __init__(self, msg, at):
+        super().__init__(msg)
+        self.at = at
+
+
+class LoginRejected(RuntimeError):
+    """The service rejected the login's token (HTTP 401/403) although it has not expired."""
+
+    def __init__(self, msg, code):
+        super().__init__(msg)
+        self.code = code
+
+
+LOGIN_CMD = {'claude': 'claude auth login', 'codex': 'codex login'}
+TOOL = {'claude': 'Claude Code', 'codex': 'Codex'}
+
+
+_NUM_WORDS = {w: i for i, w in enumerate('zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen '
+                                          'seventeen eighteen nineteen twenty'.split())}
+_NUM_WORDS.update(thirty=30, forty=40, fifty=50, sixty=60, ninety=90)
+_UNIT_MIN = {'minute': 1, 'min': 1, 'hour': 60, 'day': 1440, 'week': 10080}
+
+
+def name_length(name):
+    """Length (min) a window's name states, as in five_hour or seven_day_opus: a number (in digits or an English word) and a unit
+    (minute, hour, day or week) at the start. None when the name states none (a month has no fixed length, so it is not taken)."""
+    m = re.match(r'([a-z]+|\d+)_(minute|min|hour|day|week)s?(?:_|$)', str(name).lower())
+    if not m:
+        return None
+    n = int(m.group(1)) if m.group(1).isdigit() else _NUM_WORDS.get(m.group(1))
+    return n * _UNIT_MIN[m.group(2)] if n else None
+
+
 def parse_claude(d, notes=None):
-    """Usage API response → [{side, id, u, r, scoped}]. The limits array if present, else every top-level object with utilization (older responses;
-    the kind is its key). Every kind is taken; the API gives no length, so it is estimated from the reads (estimate_length), not from the kind."""
+    """Usage API response → [{side, id, u, r, scoped, nwin}]. The limits array if present, else every top-level object with utilization (older responses;
+    the kind is its key). Every kind is taken. The limits array gives no length; nwin is the length (min) the name of the top-level object with the
+    same reset time states (name_length: five_hour, seven_day), when exactly one length is found; load_series checks it against the reads."""
     def ts(s):
         return int(datetime.datetime.fromisoformat(s.replace('Z', '+00:00')).timestamp()) if s else None
+
+    def exact(s):
+        try:
+            return datetime.datetime.fromisoformat(s.replace('Z', '+00:00')).timestamp() if isinstance(s, str) else None
+        except ValueError:
+            return None
+    named = {}   # exact reset time → {lengths the names of the top-level objects with it state}
+    for key, w in d.items():
+        if isinstance(w, dict) and exact(w.get('resets_at')) is not None and name_length(key):
+            named.setdefault(exact(w['resets_at']), set()).add(name_length(key))
     out = []
     for w in d.get('limits') or []:
         if not isinstance(w, dict) or w.get('percent') is None:
@@ -1273,11 +1349,18 @@ def parse_claude(d, notes=None):
         if scope:
             m = (scope.get('model') or {}) if isinstance(scope, dict) else {}
             wid += ':' + str(m.get('display_name') or m.get('id') or (scope.get('surface') if isinstance(scope, dict) else '') or 'scope')
-        out.append({'side': 'claude', 'id': wid, 'u': float(w['percent']), 'r': ts(w.get('resets_at')), 'scoped': bool(scope)})
+        row = {'side': 'claude', 'id': wid, 'u': float(w['percent']), 'r': ts(w.get('resets_at')), 'scoped': bool(scope)}
+        lens = named.get(exact(w.get('resets_at')), set())
+        if len(lens) == 1:
+            row['nwin'] = next(iter(lens))
+        out.append(row)
     if not out:
         for key, w in d.items():
             if isinstance(w, dict) and w.get('utilization') is not None:
-                out.append({'side': 'claude', 'id': key, 'u': float(w['utilization']), 'r': ts(w.get('resets_at')), 'scoped': False})
+                row = {'side': 'claude', 'id': key, 'u': float(w['utilization']), 'r': ts(w.get('resets_at')), 'scoped': False}
+                if name_length(key):
+                    row['nwin'] = name_length(key)
+                out.append(row)
     return out
 
 
@@ -1287,7 +1370,9 @@ def read_claude(t, notes=None):
     import urllib.request
     cred = claude_credentials()
     if cred.get('expiresAt') and cred['expiresAt'] / 1000 < t:
-        raise RuntimeError('Claude access token expired (unreadable until Claude Code refreshes it; not refreshed here)')
+        at = cred['expiresAt'] / 1000
+        raise TokenExpired(f'Claude access token expired at {time.strftime("%m-%d %H:%M", time.localtime(at))} '
+                           '(unreadable until Claude Code refreshes it; not refreshed here)', at)
     url = 'https://api.anthropic.com/api/oauth/usage'
     test_url = os.environ.get('CLAUDE_CODEX_ROUTER_CLAUDE_URL', '')   # for tests. Only a local fake server is allowed, so the token is never sent out
     if test_url:
@@ -1300,6 +1385,8 @@ def read_claude(t, notes=None):
     except urllib.error.HTTPError as e:
         if e.code == 429:
             raise RateLimited('Claude usage API returned 429 (too many requests)') from e
+        if e.code in (401, 403):
+            raise LoginRejected(f'Claude usage API rejected the login (HTTP {e.code}) although the token has not expired', e.code) from e
         raise
     out = parse_claude(d, notes)
     if not out:
@@ -1334,23 +1421,40 @@ def _jwt_exp(tok):
         return None
 
 
+def codex_tokens():
+    """(access token, account id) of Codex's ChatGPT login ($CODEX_HOME/auth.json). NotLoggedIn without one."""
+    f = os.path.join(CODEX_HOME, 'auth.json')
+    try:
+        with open(f) as fh:
+            tokens = json.load(fh).get('tokens') or {}
+    except (OSError, ValueError, AttributeError) as e:
+        raise NotLoggedIn(f'no Codex login ({f}: {e.__class__.__name__})') from e
+    if not tokens.get('access_token'):
+        raise NotLoggedIn('Codex is not logged in with a ChatGPT plan (API-key login has no plan usage)')
+    return tokens['access_token'], tokens.get('account_id')
+
+
+def logged_in(side):
+    """Whether side has a plan login on this machine (an expired token still counts: the tool refreshes it when used). Nothing is sent out."""
+    try:
+        claude_credentials() if side == 'claude' else codex_tokens()
+    except NotLoggedIn:
+        return False
+    except Exception:   # noqa: BLE001 — unreadable for another reason: the login may still be there
+        return True
+    return True
+
+
 def read_codex(t, timeout=15, notes=None):
     """ChatGPT usage (GET /backend-api/wham/usage; the endpoint written in the Codex CLI executable).
     The token is only read from Codex's login info ($CODEX_HOME/auth.json, default ~/.codex) and never refreshed (Codex refreshes it)."""
     import urllib.error
     import urllib.request
-    f = os.path.join(CODEX_HOME, 'auth.json')
-    try:
-        with open(f) as fh:
-            tokens = json.load(fh).get('tokens') or {}
-    except (OSError, ValueError) as e:
-        raise RuntimeError(f'no Codex login ({f}: {e.__class__.__name__})') from e
-    tok, acct = tokens.get('access_token'), tokens.get('account_id')
-    if not tok:
-        raise RuntimeError('Codex is not logged in with a ChatGPT plan (API-key login has no plan usage)')
+    tok, acct = codex_tokens()
     exp = _jwt_exp(tok)
     if exp and exp < t:
-        raise RuntimeError('Codex access token expired (unreadable until Codex refreshes it; not refreshed here)')
+        raise TokenExpired(f'Codex access token expired at {time.strftime("%m-%d %H:%M", time.localtime(exp))} '
+                           '(unreadable until Codex refreshes it; not refreshed here)', exp)
     url = 'https://chatgpt.com/backend-api/wham/usage'
     test_url = os.environ.get('CLAUDE_CODEX_ROUTER_CODEX_URL', '')   # for tests. Only a local fake server is allowed, so the token is never sent out
     if test_url:
@@ -1360,8 +1464,13 @@ def read_codex(t, timeout=15, notes=None):
     h = {'Authorization': 'Bearer ' + tok, 'User-Agent': 'claude-codex-router'}
     if acct:
         h['ChatGPT-Account-Id'] = acct
-    with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=timeout) as r:
-        d = json.load(r)
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=timeout) as r:
+            d = json.load(r)
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            raise LoginRejected(f'ChatGPT usage API rejected the login (HTTP {e.code}) although the token has not expired', e.code) from e
+        raise
     out = parse_codex(d)
     if not out:
         raise RuntimeError('no Codex usage windows in the response')
@@ -1377,8 +1486,35 @@ def recent_rows(side, t, max_age=RECENT_MAX_AGE):
     return [{**x, 'cached': True} for x in rows if x['ts'] == last]
 
 
-def read_both(t):
+def last_read(side, log=None):
+    """Time of the latest read of side by this tool in the records (None if there is none)."""
+    ts = [x['ts'] for x in (read_log() if log is None else log) if x.get('side') == side and x.get('src') == 'live']
+    return max(ts) if ts else None
+
+
+def login_state(side, e, t, log=None):
+    """What is known about side's login from the failure e of reading it: {'state', 'last_read', 'action'} (state not_logged_in | token_expired |
+    login_rejected; expired_at or http too), or None when e is not about the login (network, the service, the response).
+    Whether the login can still be renewed is not known here (the token is never renewed here), so the action gives both remedies in order."""
+    tool, cmd = TOOL[side], LOGIN_CMD[side]
+    if isinstance(e, NotLoggedIn):
+        d = {'state': 'not_logged_in', 'action': f'{tool} is not logged in with a plan on this machine; to use it, log in (`{cmd}`)'}
+    elif isinstance(e, TokenExpired):
+        d = {'state': 'token_expired', 'expired_at': int(e.at),
+             'action': f'{tool} has not renewed its login since {time.strftime("%m-%d %H:%M", time.localtime(e.at))} (it renews it when it runs): '
+                       f'start {tool} once; if it still is not readable, log in again (`{cmd}`)'}
+    elif isinstance(e, LoginRejected):
+        d = {'state': 'login_rejected', 'http': e.code,
+             'action': f'the service rejected the login of {tool} (HTTP {e.code}): start {tool} once; if it still is not readable, log in again (`{cmd}`)'}
+    else:
+        return None
+    d['last_read'] = last_read(side, log)
+    return d
+
+
+def read_both(t, login=None):
     """Read both. If one side is unreadable, the other is still returned. Returns (rows, list of failures, list of notes).
+    login (a dict, optional) receives login_state of each side whose login kept it from being read.
     For Claude, if there is a record within CLAUDE_MIN_INTERVAL seconds, it is used without calling the API.
     If Claude's API returns 429, the latest value in the records (within RECENT_MAX_AGE seconds) is used without calling again."""
     rows, errs, notes = [], [], []
@@ -1403,6 +1539,9 @@ def read_both(t):
                 errs.append(f'{name}: {e} (no record within {RECENT_MAX_AGE // 60} min either)')
         except Exception as e:   # noqa: BLE001 — report why it could not be read as is
             errs.append(f'{name}: {e}')
+            st = login_state(name.lower(), e, t) if login is not None else None
+            if st:
+                login[name.lower()] = st
     return rows, errs, notes
 
 
@@ -1427,7 +1566,8 @@ def sample_note(t):
 
 def decide_now(t, main=MAIN):
     """Read both, add them to the records, and decide. Returns (result dict, exit code)."""
-    rows, errs, notes = read_both(t)
+    login = {}
+    rows, errs, notes = read_both(t, login=login)
     sn = sample_note(t)
     if sn:
         notes.append(sn)
@@ -1442,7 +1582,7 @@ def decide_now(t, main=MAIN):
         notes.append(f'prices: {_price_src}')
     res = {'pick': None, 'main': main, 'reason': '', 'tie': False, 'guard': [], 'full': [], 'claude_left_usd': None, 'codex_left_usd': None,
            'claude_L': None, 'codex_L': None,
-           'windows': {}, 'errors': errs, 'notes': notes}
+           'windows': {}, 'login': login, 'errors': errs, 'notes': notes}
     for side in states:
         for k, v in states[side].items():
             res['windows'][k] = {kk: (round(vv, 4) if isinstance(vv, float) else vv) for kk, vv in v.items()}
@@ -1456,10 +1596,12 @@ def decide_now(t, main=MAIN):
             notes.append(f'expected leftover in cost unknown for {" and ".join(miss)} (a window without a limit in cost); the comparison uses the leftover probability')
         return res, 0
     if states['claude'] or states['codex']:
-        pick, reason, over = decide_one_side(states, main)
+        other = 'codex' if states['claude'] else 'claude'
+        pick, reason, over = decide_one_side(states, main, other_logged_in=logged_in(other))
         res.update(pick=pick, reason=reason, guard=over)
         return res, 1
-    res.update(pick=TIE_DEFAULT, reason='both_unreadable')
+    ins = [s for s in ('claude', 'codex') if logged_in(s)]
+    res.update(pick=ins[0] if len(ins) == 1 else TIE_DEFAULT, reason='both_unreadable')   # never a side that is not logged in, when the other is
     return res, 2
 
 
@@ -1469,6 +1611,9 @@ def print_human(res):
     print(f'pick: {res["pick"]} (reason {res["reason"]}, main {res["main"]})')
     for e in res['errors']:
         print('  error:', e)
+    for side, v in res.get('login', {}).items():
+        last = time.strftime('%m-%d %H:%M', time.localtime(v['last_read'])) if v.get('last_read') else 'never'
+        print(f'  login ({side}): {v["state"]}, last read {last}: {v["action"]}')
     for e in res['notes']:
         print('  note:', e)
     for k, v in res['windows'].items():
@@ -1498,6 +1643,51 @@ def print_human(res):
               f'  full {res["full"] or "none"}')
 
 
+# ---- forecast paths of every forecast window, for other tools (sample writes them to FORECAST_FILE) ----
+FC_STEPS = 100   # each window's period is cut into this many steps (from the reset back, so that the last step is the reset); paths are given at those after now
+
+
+def forecast_data(rows, t, log=None, n=N_SAMP):
+    """{'t', 'n', 'windows': {name: {...}}, 'notes'} for every window window_states forecasts (not model-scoped, length known). For each window: its state
+    (u, r, win, limit_usd, basis), the step times after t ('ts') and n paths of the usage (%) at those times ('paths', None when the records are too short).
+    A path is u + 100 × use ÷ limit, the use forecast in cost along one past start (forecast_paths with the horizon at the window's reset); a window
+    without a limit in cost (basis usage) is forecast on its own usage growth, u + growth. Usage beyond 100 is kept (the use if there were no limit)."""
+    aux = {}
+    states, notes, _ = window_states(rows, t, log=log, n=n, aux=aux)
+    out = {}
+    for side in ('claude', 'codex'):
+        for name, st in states[side].items():
+            if st.get('scoped') or not st.get('win') or (st.get('limit_usd') is None and st.get('basis') != 'usage'):
+                continue
+            step = st['win'] * 60 / FC_STEPS
+            ts = [p for p in (st['r'] - (FC_STEPS - k) * step for k in range(1, FC_STEPS + 1)) if p > t]
+            if st.get('basis') == 'usage':
+                ev, scale = aux[side]['usage'].get(name), 1.0
+            else:
+                ev, scale = aux[side]['cost'], 100.0 / st['limit_usd']
+            paths = forecast_paths(ev, t, [p - t for p in ts], n=n) if ts and ev else None
+            out[name] = {'side': side, 'u': st['u'], 'r': int(st['r']), 'win': st['win'], 'win_known': st.get('win_known', True),
+                         'win_lo': st.get('win_lo'), 'win_hi': st.get('win_hi'), 'basis': st.get('basis', 'cost'), 'limit_usd': st.get('limit_usd'),
+                         'step_s': step, 'ts': [round(p, 1) for p in ts],
+                         'paths': [[round(st['u'] + v * scale, 3) for v in path] for path in paths] if paths else None}
+    return {'t': int(t), 'n': n, 'windows': out, 'notes': notes}
+
+
+def write_forecast(rows, t, log=None, n=N_SAMP):
+    """Write forecast_data to FORECAST_FILE (replaced at once, so that a reader never sees half of it). Returns the number of windows written."""
+    d = forecast_data(rows, t, log=log, n=n)
+    os.makedirs(DATA, exist_ok=True)
+    tmp = FORECAST_FILE + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(d, f, separators=(',', ':'))
+    os.replace(tmp, FORECAST_FILE)
+    return len(d['windows'])
+
+
+EXIT_USAGE = 64     # a wrong argument or an unknown command (fix the call)
+EXIT_FAILURE = 70   # stopped by an unexpected error (a fault; see the traceback)
+
+
 def _arg(name):
     a = sys.argv
     return a[a.index(name) + 1] if name in a and a.index(name) + 1 < len(a) else None
@@ -1509,7 +1699,7 @@ def main():
         m = _arg('--main') or MAIN
         if m not in ('claude', 'codex'):
             print('--main must be claude or codex', file=sys.stderr)
-            sys.exit(2)
+            sys.exit(EXIT_USAGE)
         res, code = decide_now(time.time(), m)
         if '--json' in sys.argv:
             print(json.dumps(res))
@@ -1518,23 +1708,37 @@ def main():
         sys.exit(code)
     if cmd == 'sample':
         t = time.time()
-        rows, errs, notes = read_both(t)
-        rows = [x for x in rows if not x.get('cached')]
+        login = {}
+        read, errs, notes = read_both(t, login=login)
+        rows = [x for x in read if not x.get('cached')]
         record(rows)
         load_prices(refresh=True)
         try:
             added = sync_costs(full=not os.path.exists(COST_STATE))
         except Exception as e:   # noqa: BLE001
             added, notes = {}, notes + [f'could not add cost records: {e}']
+        fc = None
+        if read:
+            try:
+                fc = write_forecast(read, t)   # the records used instead (cached) count too, as for now
+            except Exception as e:   # noqa: BLE001 — sampling goes on even if the forecast fails
+                notes = notes + [f'could not write the forecast: {e}']
         os.makedirs(DATA, exist_ok=True)
         with open(SAMPLE_STAMP, 'w') as f:
             f.write(f'{int(t)}\n')
         usage_added = added.pop('usage', 0) if isinstance(added, dict) else 0
-        print(f'windows recorded {len(rows)}  cost rows {added}  usage rows from logs {usage_added}' + (f'  errors: {errs}' if errs else '') + (f'  notes: {notes}' if notes else ''))
+        lg = ', '.join(f'{k} {v["state"]}' for k, v in login.items())
+        print(f'windows recorded {len(rows)}  cost rows {added}  usage rows from logs {usage_added}  forecast windows {fc}' + (f'  errors: {errs}' if errs else '')
+              + (f'  login: {lg}' if lg else '') + (f'  notes: {notes}' if notes else ''))
         sys.exit(0 if rows else 1)
     print(USAGE)
-    sys.exit(0 if cmd in ('', '-h', '--help', 'help') else 2)
+    sys.exit(0 if cmd in ('', '-h', '--help', 'help') else EXIT_USAGE)
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except Exception:   # noqa: BLE001 — a fault: its own exit code, apart from the results of reading
+        import traceback
+        traceback.print_exc()
+        sys.exit(EXIT_FAILURE)

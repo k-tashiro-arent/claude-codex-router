@@ -3,7 +3,7 @@
 #
 # What it does:
 #   1) Dependency check (python3 is required; missing Codex or Claude Code login info only gives a warning)
-#   2) Places router.py in $CLAUDE_CODEX_ROUTER_DIR (default ~/.claude/codex-router)
+#   2) Places router.py in $CLAUDE_CODEX_ROUTER_DIR (default ~/.claude-codex-router)
 #   3) Places the default config.json (an existing one is not overwritten)
 #   4) Sets up a timer that calls `router.py sample` every 5 minutes
 #        the first usable one, in the order systemd user timer → macOS launchd → crontab
@@ -19,7 +19,7 @@
 set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DIR="${CLAUDE_CODEX_ROUTER_DIR:-$HOME/.claude/codex-router}"
+DIR="${CLAUDE_CODEX_ROUTER_DIR:-$HOME/.claude-codex-router}"
 SCHED="${CLAUDE_CODEX_ROUTER_SCHEDULER:-auto}"
 VERSION="$(cat "$SRC/VERSION" 2>/dev/null || echo "0.0.0")"
 OLD_VER="$([[ -f "$DIR/.version" ]] && cat "$DIR/.version" 2>/dev/null || echo "")"
@@ -41,10 +41,17 @@ if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)'; 
 fi
 PY="$(command -v python3)"
 CODEX_AUTH="${CODEX_HOME:-$HOME/.codex}/auth.json"
-[[ -f "$CODEX_AUTH" ]] || echo "  WARNING: $CODEX_AUTH not found. The Codex usage windows cannot be read until you log in to Codex with a ChatGPT plan."
+no_codex="" no_claude=""
+[[ -f "$CODEX_AUTH" ]] || { no_codex=1; echo "  WARNING: $CODEX_AUTH not found. The Codex usage windows cannot be read until you log in to Codex with a ChatGPT plan."; }
 CRED="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
-if [[ ! -f "$CRED" && "$(uname -s)" != "Darwin" ]]; then
+if [[ ! -f "$CRED" && "$(uname -s)" != "Darwin" ]]; then   # on macOS they may be in the Keychain
+  no_claude=1
   echo "  WARNING: $CRED not found. The Claude usage windows cannot be read until you log in to Claude Code."
+fi
+if [[ -n "$no_codex" && -z "$no_claude" ]]; then
+  echo "           Until then it picks Claude (unless Claude is the main side and likely to reach its limit); the Claude records still accumulate for when both can be compared."
+elif [[ -n "$no_claude" && -z "$no_codex" ]]; then
+  echo "           Until then it picks Codex (unless Codex is the main side and likely to reach its limit); the Codex records still accumulate for when both can be compared."
 fi
 
 # 2) Place the files
@@ -279,3 +286,18 @@ fi
 echo "  decision now    : python3 \"$DIR/bin/router.py\" now        (now --json for machines)"
 echo "  settings        : $DIR/config.json"
 echo "  uninstall       : bash \"$DIR/uninstall.sh\" (keeps the records)"
+
+# 7) first decision: reads both usage windows and all the conversation logs (the first read; it can take tens of seconds), as a check too.
+#    Done here, so that the first delegation right after installing does not wait for it. A failure does not fail the installation
+echo ""
+echo "Check: deciding once (reads both usage windows and the conversation logs; the first time can take tens of seconds) ..."
+set +e
+CLAUDE_CODEX_ROUTER_DIR="$DIR" "$PY" "$DIR/bin/router.py" now
+rc=$?
+set -e
+case $rc in
+  0) echo "Check: OK (read both Claude and Codex)";;
+  1) echo "Check: only one side could be read (see the error lines above); the router picks that side until both can be read";;
+  2) echo "Check: neither side could be read (see the error lines above); log in to Claude Code and Codex";;
+  *) echo "Check: router.py stopped with exit code $rc (see above)";;
+esac

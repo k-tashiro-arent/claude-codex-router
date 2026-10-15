@@ -19,13 +19,15 @@ The scope is **all of reading, running and editing**.
 ~/.claude/skills/codex-offload/pick.sh --main claude
 ```
 - The output is one line, "`<codex|claude> <reason>`". Hand off to the side named by the first word.
-  - If claude-codex-router (`~/.claude/codex-router/bin/router.py`, location `CLAUDE_CODEX_ROUTER_DIR`) is installed, follow its decision (the cost each contract is expected to leave unused by the next reset of its longest window, and the guard on the delegating side).
-  - When it is not installed, did not answer, or its answer is unreadable: `codex` (Codex first).
-  - The flag file `~/.claude/codex-router/force` (location `CLAUDE_CODEX_ROUTER_FORCE_FILE`) fixes the target: while it holds `claude` or `codex`, that side is returned without calling the router. Write it with `echo claude > …` or `echo codex > …` and remove it with `rm` (only when the requester asks). Anything else in it is ignored, and the line says so.
+  - If claude-codex-router (`~/.claude-codex-router/bin/router.py`, location `CLAUDE_CODEX_ROUTER_DIR`) is installed, follow its decision (the cost each contract is expected to leave unused by the next reset of its longest window, and the guard on the delegating side).
+  - When it is not installed, did not answer, or its answer is unreadable: the side that is logged in when only one is; otherwise (both or neither) `tie_default` in the router's `config.json` (`codex` by default).
+  - The flag file `~/.claude-codex-router/force` (location `CLAUDE_CODEX_ROUTER_FORCE_FILE`) fixes the target: while it holds `claude` or `codex`, that side is returned without calling the router. Write it with `echo claude > …` or `echo codex > …` and remove it with `rm` (only when the requester asks). Anything else in it is ignored, and the line says so.
 - When delegating several tasks in parallel, call it once for each (every call reads the current usage windows; it takes a few seconds).
 - **codex** → run.sh as in "How to call it" below.
 - **claude** → "Handing off to a Claude subagent" below.
 - In the report to the requester, write one line with the delegation target and the reason from `pick.sh`.
+- If the line contains `ACTION FOR THE USER`, a login has stopped working and only the requester can fix it. Put that part of the line, as it is,
+  at the top of the report (not only in the line above), and do not try to log in or fix it yourself.
 
 ## How to call it (handing off to Codex)
 ```bash
@@ -69,5 +71,7 @@ run.sh automatically prepends the preamble (`preamble.md`: no changes outside th
 ## When it is unavailable
 If handing off to Codex gives `UNAVAILABLE:` (usage limit, rate limit, authentication, connection), switch to a Claude subagent with the same request body
 (Explore for reading). Write one line in the report to the requester saying you switched.
+If the `UNAVAILABLE:` line is about the login (`401`, `unauthorized`, `not logged in`, `login`), also write at the top of the report that Codex's login
+needs the requester: start Codex once, and if it still fails, log in again (`codex login`).
 When a Claude subagent did not run because of its usage limit, switch to Codex (run.sh) with the same request body, and write one line about it in the report.
 `NO-RESULT:` (it ran but the report is empty) is not an availability problem. Look at the end of `stderr.txt` and `events.jsonl` to find the cause.

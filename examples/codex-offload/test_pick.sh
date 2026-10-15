@@ -7,7 +7,7 @@ trap 'rm -rf "$work"' EXIT
 fails=0
 check() {  # check <name> <expected first word> <expected phrase>
   local out
-  out="$(CLAUDE_CODEX_ROUTER_DIR="$work/r" bash "$HERE/pick.sh")"
+  out="$(CLAUDE_CODEX_ROUTER_DIR="$work/r" CODEX_HOME="${T_CODEX:-$work/codex}" CLAUDE_CONFIG_DIR="${T_CLAUDE:-$work/claude}" bash "$HERE/pick.sh")"
   local rc=$?
   if [[ $rc != 0 || "${out%% *}" != "$2" || "$out" != *"$3"* ]]; then
     echo "FAIL: $1 → rc=$rc \"$out\""; fails=$((fails + 1))
@@ -23,8 +23,25 @@ fake() {  # fake <body of router.py>
   printf '%s\n' "$1" > "$work/r/bin/router.py"
 }
 
+mkdir -p "$work/codex" "$work/claude"   # both logged in unless a check says otherwise
+printf '{"tokens": {"access_token": "t"}}\n' > "$work/codex/auth.json"
+echo '{}' > "$work/claude/.credentials.json"
 rm -rf "$work/r"
 check "no router" codex "not installed"
+mkdir -p "$work/nocodex" "$work/apikey"
+printf '{"OPENAI_API_KEY": "sk-x", "tokens": null}\n' > "$work/apikey/auth.json"
+mkdir -p "$work/r"; echo '{"tie_default": "claude"}' > "$work/r/config.json"
+check "no router, both logged in: tie_default in config.json" claude "claude (tie_default)"
+rm -rf "$work/r"
+T_CLAUDE="$work/nocodex" check "no router, Claude not logged in: Codex" codex "Claude is not logged in"
+T_CODEX="$work/nocodex" check "no router, Codex not logged in: Claude, not Codex" claude "Codex is not logged in"
+T_CODEX="$work/apikey" check "no router, Codex only with an API key: Claude" claude "Codex is not logged in"
+if [ "$(uname -s)" != Darwin ]; then   # on macOS the Keychain may hold real Claude credentials
+  T_CODEX="$work/nocodex" T_CLAUDE="$work/nocodex" check "no router, neither logged in: tie_default (codex when unset)" codex "codex (tie_default; neither is logged in)"
+  mkdir -p "$work/r"; echo '{"tie_default": "claude"}' > "$work/r/config.json"
+  T_CODEX="$work/nocodex" T_CLAUDE="$work/nocodex" check "no router, neither logged in: tie_default in config.json" claude "claude (tie_default; neither is logged in)"
+  rm -rf "$work/r"
+fi
 
 fake 'import json; print(json.dumps({"pick": "claude", "reason": "leftover", "claude_L": 0.9, "codex_L": 0.5, "guard": [], "full": [], "errors": []}))'
 check "router picks claude (probability, an older router or leftover_prob)" claude "leftover (leftover probability Claude 0.90 / Codex 0.50)"
@@ -47,8 +64,27 @@ check "full window" codex "full: claude-session"
 fake 'import json, sys; print(json.dumps({"pick": "claude", "reason": "codex_unreadable", "claude_L": None, "codex_L": None, "guard": [], "errors": ["Codex: x"]})); sys.exit(1)'
 check "follows the decision even when only one side was read (exit code 1)" claude "errors: Codex: x"
 
+fake 'import json, sys; print(json.dumps({"pick": "claude", "reason": "codex_unreadable", "guard": [], "errors": ["Codex: expired"], "login": {"codex": {"state": "token_expired", "expired_at": 1, "last_read": 1791800000, "action": "start Codex once; log in again (`codex login`)"}}})); sys.exit(1)'
+check "a login that stopped working is marked for the user" claude "ACTION FOR THE USER (codex, last read "
+check "the marked part carries the router's action" claude "log in again (\`codex login\`)"
+fake 'import json, sys, time; print(json.dumps({"pick": "claude", "reason": "codex_unreadable", "guard": [], "errors": ["Codex: 401"], "login": {"codex": {"state": "login_rejected", "http": 401, "last_read": int(time.time()) - 300, "action": "log in"}}})); sys.exit(1)'
+out="$(CLAUDE_CODEX_ROUTER_DIR="$work/r" CODEX_HOME="$work/codex" CLAUDE_CONFIG_DIR="$work/claude" bash "$HERE/pick.sh")"
+if [[ "$out" == *"ACTION FOR THE USER"* || "$out" != *"errors: Codex: 401"* ]]; then
+  echo "FAIL: a rejected read 5 minutes after a good one is not marked for the user → \"$out\""; fails=$((fails + 1))
+else
+  echo "ok  : a rejected read 5 minutes after a good one is not marked for the user → $out"
+fi
+fake 'import json, sys; print(json.dumps({"pick": "claude", "reason": "codex_not_logged_in", "guard": [], "errors": ["Codex: no login"], "login": {"codex": {"state": "not_logged_in", "last_read": None, "action": "log in"}}})); sys.exit(1)'
+out="$(CLAUDE_CODEX_ROUTER_DIR="$work/r" CODEX_HOME="$work/codex" CLAUDE_CONFIG_DIR="$work/claude" bash "$HERE/pick.sh")"
+if [[ "$out" == *"ACTION FOR THE USER"* ]]; then
+  echo "FAIL: a side that is not logged in is not marked for the user → \"$out\""; fails=$((fails + 1))
+else
+  echo "ok  : a side that is not logged in is not marked for the user → $out"
+fi
+
 fake 'raise SystemExit("boom")'
 check "router is broken" codex "gave no answer"
+T_CODEX="$work/nocodex" check "router is broken, Codex not logged in: Claude" claude "gave no answer"
 
 fake 'print("not json")'
 check "answer unreadable" codex "gave no answer"

@@ -38,13 +38,15 @@ class TempDirCase(unittest.TestCase):
     def setUp(self):
         self.d = tempfile.mkdtemp()
         self.saved = {k: getattr(route, k) for k in ('DATA', 'USAGE_LOG', 'COST_LOG', 'COST_STATE', 'PRICE_FILE',
-                                                     'CLAUDE_HOME', 'CODEX_HOME', 'TP', '_prices', 'CONFIG', 'SAMPLE_STAMP', 'VERSION_FILE')}
+                                                     'CLAUDE_HOME', 'CODEX_HOME', 'TP', '_prices', 'CONFIG', 'SAMPLE_STAMP', 'VERSION_FILE',
+                                                     'FORECAST_FILE')}
         route.DATA = os.path.join(self.d, 'data')
         route.USAGE_LOG = os.path.join(route.DATA, 'usage.jsonl')
         route.COST_LOG = {s: os.path.join(route.DATA, f'cost-{s}.jsonl') for s in ('claude', 'codex')}
         route.COST_STATE = os.path.join(route.DATA, 'cost-state.json')
         route.PRICE_FILE = os.path.join(route.DATA, 'litellm-prices.json')
         route.SAMPLE_STAMP = os.path.join(route.DATA, 'last-sample')
+        route.FORECAST_FILE = os.path.join(route.DATA, 'forecast.json')
         route.VERSION_FILE = os.path.join(self.d, '.version')
         route.CLAUDE_HOME, route.CODEX_HOME = os.path.join(self.d, 'claude'), os.path.join(self.d, 'codex')
         route.TP = os.path.join(self.d, 'token-pace') + '/'
@@ -267,6 +269,36 @@ class LengthTests(unittest.TestCase):
         self.assertAlmostEqual(ser.win_min, 7 * 1440, delta=5)              # the start is between the two reads (5 minutes before, 1 minute after)
         self.assertTrue(ser.known)
 
+    def test_length_from_the_name_when_the_reads_agree_or_give_none(self):
+        t = 10 * 86400.0
+        one = [{'ts': int(t - 3600), 'side': 'claude', 'id': 'weekly_all', 'nwin': 10080, 'u': 10.0, 'r': int(t + 3 * 86400)}]   # a lower bound of 3 days 1 hour
+        ser = route.load_series('claude', one)['weekly_all']
+        self.assertEqual((ser.win_min, ser.known, ser.lo, ser.hi, ser.len_note), (10080, True, 10080, 10080, None))
+        r_prev = t - 4 * 86400
+        log = [{'ts': int(r_prev - 300), 'side': 'claude', 'id': 'weekly_all', 'nwin': 10080, 'u': 60.0, 'r': int(r_prev)},
+               {'ts': int(r_prev + 60), 'side': 'claude', 'id': 'weekly_all', 'nwin': 10080, 'u': 1.0, 'r': int(r_prev + 7 * 86400)}]
+        self.assertEqual(route.load_series('claude', log)['weekly_all'].win_min, 10080)     # within the bracket of the reads
+
+    def test_reads_win_over_the_name_when_they_disagree(self):
+        # the name still says five_hour, but the periods are 4 hours (bracketed by reads 5 minutes apart): the reads are used, and a note says so
+        H4 = 240 * 60
+        log, t = [], 0
+        for _ in range(3):
+            log += [{'ts': t + 1000, 'side': 'claude', 'id': 'session', 'nwin': 300, 'u': 0.0, 'r': None},
+                    {'ts': t + 1300, 'side': 'claude', 'id': 'session', 'nwin': 300, 'u': 4.0, 'r': t + 1150 + H4}]
+            t += H4 + 5000
+        ser = route.load_series('claude', log)['session']
+        self.assertAlmostEqual(ser.win_min, 240, delta=3)
+        self.assertIn('the name states 5h', ser.len_note)
+        self.assertIn('the reads are used', ser.len_note)
+        states, notes, _ = route.window_states([{'side': 'claude', 'id': 'session', 'nwin': 300, 'u': 4.0, 'r': t + 600}], t, log=log)
+        self.assertIn(ser.len_note, notes)
+        # a lower bound above the stated length: the reads too
+        one = [{'ts': 0, 'side': 'claude', 'id': 'session', 'nwin': 300, 'u': 10.0, 'r': 6 * 3600}]
+        ser = route.load_series('claude', one)['session']
+        self.assertEqual((ser.win_min, ser.known), (360, False))
+        self.assertIn('at least 360 min', ser.len_note)
+
     def test_limit_not_from_the_current_window_while_the_start_is_unknown(self):
         t = at('2026-10-07 12:00')
         cs_ = route.CostSeries([(t - 3600, 50.0)], t)
@@ -284,16 +316,38 @@ class ParseTests(unittest.TestCase):
             {'kind': 'monthly_x', 'group': 'monthly', 'percent': 5, 'resets_at': '2026-11-01T00:00:00+00:00', 'scope': None}]}
         notes = []
         rows = route.parse_claude(d, notes)
-        # every kind is taken, unknown ones too; no length (the API gives none; it is estimated from the reads)
+        # every kind is taken, unknown ones too; no length (the limits array gives none, and there is no top-level object with the same reset)
         self.assertEqual([(x['id'], x['u'], x['scoped']) for x in rows],
                          [('session', 32.0, False), ('weekly_all', 18.0, False), ('weekly_scoped:Fable', 0.0, True), ('monthly_x', 5.0, False)])
-        self.assertTrue(all('win' not in x for x in rows))
+        self.assertTrue(all('win' not in x and 'nwin' not in x for x in rows))
         self.assertEqual(notes, [])
 
     def test_claude_old_shape(self):
         d = {'five_hour': {'utilization': 12.0, 'resets_at': '2026-10-07T19:59:59+00:00'},
              'seven_day': {'utilization': 40.0, 'resets_at': '2026-10-14T05:59:59+00:00'}}
-        self.assertEqual([(x['id'], x.get('win')) for x in route.parse_claude(d)], [('five_hour', None), ('seven_day', None)])   # the kind is the key
+        self.assertEqual([(x['id'], x.get('win'), x['nwin']) for x in route.parse_claude(d)],
+                         [('five_hour', None, 300), ('seven_day', None, 10080)])   # the kind is the key, the length the one the key states
+
+    def test_claude_length_from_the_name_with_the_same_reset(self):
+        d = {'five_hour': {'utilization': 46.0, 'resets_at': '2026-10-15T03:00:00.274360+00:00'},
+             'seven_day': {'utilization': 19.0, 'resets_at': '2026-10-21T06:00:00.274379+00:00'},
+             'seven_day_opus': None, 'tangelo': {'utilization': 3.0, 'resets_at': '2026-11-01T00:00:00+00:00'},
+             'limits': [{'kind': 'session', 'percent': 46, 'resets_at': '2026-10-15T03:00:00.274360+00:00', 'scope': None},
+                        {'kind': 'weekly_all', 'percent': 19, 'resets_at': '2026-10-21T06:00:00.274379+00:00', 'scope': None},
+                        {'kind': 'weekly_scoped', 'percent': 0, 'resets_at': '2026-10-21T06:00:00+00:00',
+                         'scope': {'model': {'display_name': 'Fable'}}},
+                        {'kind': 'other', 'percent': 3, 'resets_at': '2026-11-01T00:00:00+00:00', 'scope': None}]}
+        self.assertEqual([(x['id'], x.get('nwin')) for x in route.parse_claude(d)],
+                         [('session', 300), ('weekly_all', 10080), ('weekly_scoped:Fable', None),   # the scoped one resets 0.27 s apart: no match
+                          ('other', None)])                                                      # tangelo states no length
+        d['five_hour_x'] = {'utilization': 46.0, 'resets_at': '2026-10-15T03:00:00.274360+00:00'}
+        d['seven_hour'] = {'utilization': 46.0, 'resets_at': '2026-10-15T03:00:00.274360+00:00'}
+        self.assertNotIn('nwin', route.parse_claude(d)[0])                # two lengths with the same reset: none is taken
+
+    def test_name_length(self):
+        self.assertEqual([route.name_length(n) for n in ('five_hour', 'seven_day', 'seven_day_sonnet', '30_minutes', 'two_weeks', 'one_month',
+                                                          'tangelo', 'extra_usage', 'session')],
+                         [300, 10080, 10080, 30, 20160, None, None, None, None])
 
     def test_codex_windows_by_length(self):
         d = {'rate_limit': {'allowed': True, 'primary_window': {'used_percent': 35, 'limit_window_seconds': 604800, 'reset_after_seconds': 9,
@@ -555,6 +609,13 @@ class OneSideTests(unittest.TestCase):
         s = {'claude': {'claude-session': self.st(80, 0.7, 300), 'claude-weekly_all': self.st(20, 0.1)}, 'codex': {}}
         self.assertEqual(route.decide_one_side(s, 'claude'), ('codex', 'guard', ['claude-session']))
 
+    def test_a_side_not_logged_in_is_never_chosen(self):
+        # only Claude is used (Codex not logged in): over guard it still stays on Claude, and the reason says Codex is not logged in
+        s = {'claude': {'claude-session': self.st(80, 0.7, 300)}, 'codex': {}}
+        self.assertEqual(route.decide_one_side(s, 'claude', other_logged_in=False), ('claude', 'codex_not_logged_in', []))
+        s = {'claude': {}, 'codex': {'codex-7d': self.st(90, 0.9)}}
+        self.assertEqual(route.decide_one_side(s, 'codex', other_logged_in=False), ('codex', 'claude_not_logged_in', []))
+
 
 def W(m, L, r, length, lo=None, hi=None):
     return {'m': m, 'L': L, 'r': r, 'len': length, 'lo': length if lo is None else lo, 'hi': length if hi is None else hi}
@@ -815,6 +876,66 @@ class WindowStateTests(TempDirCase):
         self.assertLess(w['X'], 0.5)                          # 45% in 6 days, 55% left for 1 day
 
 
+class ForecastDataTests(TempDirCase):
+    def cost_rows(self, t):
+        # $10 per hour from 9:00 to 18:00 every day for 21 days (as in WindowStateTests)
+        rows = []
+        for k in range(21 * 24):
+            ts = t - 21 * D + k * H
+            if 9 <= datetime.datetime.fromtimestamp(ts).hour < 18:
+                rows += [{'k': f'{k}-{q}', 'ts': ts + q * 900 + 1, 'model': 'claude-opus-5-5', 'out': 125000} for q in range(4)]
+        return rows
+
+    def test_paths_of_every_forecast_window(self):
+        t = at('2026-10-07 12:00')
+        self.write_costs('claude', self.cost_rows(t))
+        r = t + 2 * D
+        live = [{'side': 'claude', 'id': 'weekly_all', 'win': 10080, 'u': 45.0, 'r': int(r)},
+                {'side': 'claude', 'id': 'weekly_scoped:Fable', 'win': 10080, 'u': 0.0, 'r': int(r), 'scoped': True}]
+        d = route.forecast_data(live, t, log=bracket('weekly_all', r, 10080), n=50)
+        self.assertEqual(list(d['windows']), ['claude-weekly_all'])        # the model-scoped window is not forecast
+        w = d['windows']['claude-weekly_all']
+        self.assertEqual(w['basis'], 'cost')
+        self.assertAlmostEqual(w['step_s'], w['win'] * 60 / 100)          # Claude's length is estimated from the reads (about 7 days)
+        self.assertEqual(len(w['ts']), 29)                                 # the steps of the period left (2 days of 7) after now
+        self.assertEqual(w['ts'][-1], int(r))                              # the last step is the reset
+        for a, b in zip(w['ts'], w['ts'][1:]):
+            self.assertAlmostEqual(b - a, w['step_s'], delta=0.1)
+        self.assertEqual(len(w['paths']), 50)
+        for path in w['paths']:
+            self.assertEqual(len(path), 29)
+            self.assertGreaterEqual(path[0], 45.0)
+            self.assertTrue(all(b >= a for a, b in zip(path, path[1:])))   # usage never falls along a path
+        self.assertLess(sorted(p[-1] for p in w['paths'])[25], 100.0)      # about $550 remaining, and only about $200 is used in 2 days
+
+    def test_window_forecast_on_usage_growth(self):
+        t = at('2026-10-07 12:00')
+        r = int(t + 40 * H)
+        log = [{'ts': int(t - k * H), 'side': 'codex', 'id': '7d', 'win': 10080, 'u': 60.0 - k, 'r': r, 'src': 'live'} for k in range(24, 0, -1)]
+        d = route.forecast_data([{'side': 'codex', 'id': '7d', 'win': 10080, 'u': 60.0, 'r': r}], t, log=log, n=50)
+        w = d['windows']['codex-7d']
+        self.assertEqual((w['basis'], w['limit_usd']), ('usage', None))
+        self.assertEqual(w['ts'][-1], r)
+        self.assertTrue(any(p[-1] > 60.0 for p in w['paths']))
+
+    def test_window_with_too_short_records(self):
+        # the length is known, but there is no use at all to forecast from: the window is listed without paths
+        t = at('2026-10-07 12:00')
+        d = route.forecast_data([{'side': 'codex', 'id': '7d', 'win': 10080, 'u': 0.0, 'r': int(t + D)}], t, log=[], n=20)
+        self.assertIsNone(d['windows']['codex-7d']['paths'])
+
+    def test_written_at_once(self):
+        t = at('2026-10-07 12:00')
+        self.write_costs('claude', self.cost_rows(t))
+        r = t + 2 * D
+        self.assertEqual(route.write_forecast([{'side': 'claude', 'id': 'weekly_all', 'win': 10080, 'u': 45.0, 'r': int(r)}], t,
+                                              log=bracket('weekly_all', r, 10080), n=20), 1)
+        with open(route.FORECAST_FILE) as f:
+            d = json.load(f)
+        self.assertEqual((d['t'], d['n'], len(d['windows']['claude-weekly_all']['paths'])), (int(t), 20, 20))
+        self.assertEqual(os.listdir(route.DATA).count('forecast.json.tmp'), 0)
+
+
 class CodexLoginTests(TempDirCase):
     def _auth(self, d):
         os.makedirs(route.CODEX_HOME, exist_ok=True)
@@ -823,16 +944,84 @@ class CodexLoginTests(TempDirCase):
 
     def test_unreadable_logins_say_why_without_calling_out(self):
         t = time.time()
-        with self.assertRaisesRegex(RuntimeError, 'no Codex login'):
+        with self.assertRaisesRegex(route.NotLoggedIn, 'no Codex login'):
             route.read_codex(t)
+        self.assertFalse(route.logged_in('codex'))
         self._auth({'OPENAI_API_KEY': 'sk-x', 'tokens': None})
-        with self.assertRaisesRegex(RuntimeError, 'API-key login'):
+        with self.assertRaisesRegex(route.NotLoggedIn, 'API-key login'):
             route.read_codex(t)
+        self.assertFalse(route.logged_in('codex'))                        # an API-key login has no plan: work is not handed to it
         import base64
         payload = base64.urlsafe_b64encode(json.dumps({'exp': int(t) - 60}).encode()).decode().rstrip('=')
         self._auth({'tokens': {'access_token': 'h.' + payload + '.s', 'account_id': 'a'}})
         with self.assertRaisesRegex(RuntimeError, 'expired'):
             route.read_codex(t)                                            # an expired token is not sent (nor refreshed)
+        self.assertTrue(route.logged_in('codex'))                         # but Codex is logged in (it refreshes the token when used)
+        self.assertFalse(route.logged_in('claude'))                       # no Claude Code credentials in the test home
+
+    def _serve(self, code):
+        import http.server
+        import threading
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(code)
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+        srv = http.server.HTTPServer(('127.0.0.1', 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        os.environ['CLAUDE_CODEX_ROUTER_CODEX_URL'] = f'http://127.0.0.1:{srv.server_address[1]}/x'
+        self.addCleanup(os.environ.pop, 'CLAUDE_CODEX_ROUTER_CODEX_URL', None)
+
+    def test_a_rejected_login_is_told_apart_from_other_failures(self):
+        t = time.time()
+        self._auth({'tokens': {'access_token': 'not-a-jwt', 'account_id': 'a'}})
+        self._serve(401)
+        with self.assertRaises(route.LoginRejected) as c:
+            route.read_codex(t)
+        self.assertEqual(c.exception.code, 401)
+        self._serve(503)
+        with self.assertRaises(Exception) as c:
+            route.read_codex(t)
+        self.assertNotIsInstance(c.exception, route.LoginRejected)        # the service failing is not about the login
+        self.assertIsNone(route.login_state('codex', c.exception, t))
+
+    def test_login_state_says_what_is_known_and_what_to_do(self):
+        t = at('2026-10-06 10:00')
+        log = [{'ts': t - 3 * D, 'side': 'codex', 'src': 'live'}, {'ts': t - D, 'side': 'codex', 'src': 'token-pace'},
+               {'ts': t - 60, 'side': 'claude', 'src': 'live'}]
+        d = route.login_state('codex', route.TokenExpired('x', t - 2 * D), t, log)
+        self.assertEqual((d['state'], d['expired_at'], d['last_read']), ('token_expired', int(t - 2 * D), t - 3 * D))   # the latest read by this tool
+        self.assertIn('codex login', d['action'])
+        d = route.login_state('claude', route.LoginRejected('x', 403), t, log)
+        self.assertEqual((d['state'], d['http'], d['last_read']), ('login_rejected', 403, t - 60))
+        self.assertIn('claude auth login', d['action'])
+        d = route.login_state('codex', route.NotLoggedIn('x'), t, [])
+        self.assertEqual((d['state'], d['last_read']), ('not_logged_in', None))
+
+    def test_read_both_reports_the_login_of_the_side_not_read(self):
+        t = at('2026-10-06 10:00')
+
+        def expired(t, notes=None):
+            raise route.TokenExpired('Codex access token expired', t - H)
+        saved = route.read_claude, route.read_codex
+        route.read_claude = lambda t, notes=None: [{'side': 'claude', 'id': 'weekly_all', 'win': 10080, 'u': 50.0, 'r': int(t + D)}]
+        route.read_codex = expired
+        try:
+            login = {}
+            rows, errs, notes = route.read_both(t, login=login)
+            self.assertEqual((sorted(login), login['codex']['state']), (['codex'], 'token_expired'))
+            self.assertEqual(len(errs), 1)
+            route.read_codex = lambda t, notes=None: (_ for _ in ()).throw(OSError('connection refused'))
+            login = {}
+            route.read_both(t, login=login)
+            self.assertEqual(login, {})                                     # a network failure is not about the login
+        finally:
+            route.read_claude, route.read_codex = saved
 
 
 class SampleNoteTests(TempDirCase):

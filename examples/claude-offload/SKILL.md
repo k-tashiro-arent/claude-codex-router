@@ -15,7 +15,7 @@ The scope is **all of reading, running and editing**.
 - Places the requester or a skill has declared "read-only" (e.g. a worktree another session is working in) are handed off **only in read mode**. Do not make them the `cwd` of write mode.
 
 ## Running outside the Codex sandbox
-`pick.sh` and `run.sh` need the network and files outside the workspace (`~/.claude`), so they must run outside the sandbox.
+`pick.sh` and `run.sh` need the network and files outside the workspace (`~/.claude-codex-router`, `~/.claude`), so they must run outside the sandbox.
 The claude-codex-router installer adds a Codex rule (`~/.codex/rules/claude-codex-router.rules`) that allows exactly these two files to run outside the sandbox without asking.
 **Call them by their full path as the first word of the command, as written below** (the rule matches the command prefix; `bash pick.sh`, `cd … &&` or a relative path do not match).
 
@@ -24,13 +24,15 @@ The claude-codex-router installer adds a Codex rule (`~/.codex/rules/claude-code
 ~/.agents/skills/claude-offload/pick.sh --main codex
 ```
 - The output is one line, "`<codex|claude> <reason>`". Follow the first word.
-  - If claude-codex-router (`~/.claude/codex-router/bin/router.py`, location `CLAUDE_CODEX_ROUTER_DIR`) is installed, follow its decision (the cost each contract is expected to leave unused by the next reset of its longest window, and the guard on the delegating side).
-  - When it is not installed, did not answer, or its answer is unreadable: `codex` (do it yourself).
-  - The flag file `~/.claude/codex-router/force` (location `CLAUDE_CODEX_ROUTER_FORCE_FILE`) fixes the target: while it holds `claude` or `codex`, that side is returned without calling the router. Write it with `echo claude > …` or `echo codex > …` and remove it with `rm` (only when the requester asks). Anything else in it is ignored, and the line says so.
+  - If claude-codex-router (`~/.claude-codex-router/bin/router.py`, location `CLAUDE_CODEX_ROUTER_DIR`) is installed, follow its decision (the cost each contract is expected to leave unused by the next reset of its longest window, and the guard on the delegating side).
+  - When it is not installed, did not answer, or its answer is unreadable: the side that is logged in when only one is; otherwise (both or neither) `tie_default` in the router's `config.json` (`codex` by default: do it yourself).
+  - The flag file `~/.claude-codex-router/force` (location `CLAUDE_CODEX_ROUTER_FORCE_FILE`) fixes the target: while it holds `claude` or `codex`, that side is returned without calling the router. Write it with `echo claude > …` or `echo codex > …` and remove it with `rm` (only when the requester asks). Anything else in it is ignored, and the line says so.
 - When delegating several tasks in parallel, call it once for each (every call reads the current usage windows; it takes a few seconds).
 - **claude** → run.sh as in "How to call it" below.
 - **codex** → do the work yourself.
 - In the report to the requester, write one line with the delegation target and the reason from `pick.sh`.
+- If the line contains `ACTION FOR THE USER`, a login has stopped working and only the requester can fix it. Put that part of the line, as it is,
+  at the top of the report (not only in the line above), and do not try to log in or fix it yourself.
 
 ## How to call it (handing off to Claude Code)
 ```bash
@@ -63,4 +65,6 @@ run.sh automatically prepends the preamble (`preamble.md`: no changes outside th
 
 ## When it is unavailable
 If handing off to Claude Code gives `UNAVAILABLE:` (usage limit, rate limit, authentication, connection, or the `claude` command not found: then run.sh prints it on stdout and leaves no files), do the work yourself, and write one line in the report to the requester saying so.
+If the `UNAVAILABLE:` line is about the login (`401`, `403`, `unauthorized`, `not logged in`, `/login`), also write at the top of the report that Claude Code's login
+needs the requester: start Claude Code once, and if it still fails, log in again (`claude auth login`).
 `NO-RESULT:` (it ran but the report is empty) is not an availability problem. Look at the end of `stderr.txt` and `result.json` to find the cause.
