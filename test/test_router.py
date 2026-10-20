@@ -467,6 +467,22 @@ class LimitTests(TempDirCase):
         self.assertEqual(src, 'hist')
         self.assertAlmostEqual(L, 1000.0, delta=60)
 
+    def test_reset_in_the_middle_of_the_period(self):
+        t = at('2026-10-08 12:00')
+        cs_ = self._flat(t, 10, 5.0)           # $5 per hour
+        r = t + 2 * D                           # the 7-day window started 5 days ago
+        back = t - 40 * H                       # usage went back to 0 here, the reset time unchanged
+        samples = [(r - 7 * D + k * H, min(100.0, 1.0 * k), r) for k in range(1, 80)]
+        samples += [(back + k * H, 0.5 * k, r) for k in range(0, 41)]   # 20% at t
+        ser = route.Series('claude', 'weekly_all', 10080, samples)
+        self.assertEqual(ser.period_at(t), (back, r))
+        L, src = route.limit_usd(ser, cs_, 20.0, t, r, 10080)
+        self.assertEqual(src, 'now')
+        self.assertAlmostEqual(L, 100 * 200 / 20, delta=15)          # $200 since usage went back to 0, not $600 since the window start
+        whole = route.Series('claude', 'weekly_all', 10080, [(r - 7 * D + k * H, 20 * k / 120, r) for k in range(1, 121)])
+        L, src = route.limit_usd(whole, cs_, 20.0, t, r, 10080)
+        self.assertAlmostEqual(L, 100 * 600 / 20, delta=15)          # no reset in the middle: from the window start as before
+
     def test_cost_record_shorter_than_the_window(self):
         t = at('2026-10-08 12:00')
         cs_ = self._flat(t, 3, 5.0)            # the cost records cover only 3 days (the 7-day window started 5 days ago)

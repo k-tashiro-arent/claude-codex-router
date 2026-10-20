@@ -898,6 +898,14 @@ class Series:
         _, _, xs, us = self._gs[i]
         return self._base[i] + us[bisect.bisect_right(xs, t) - 1]
 
+    def period_at(self, t):
+        """(start, reset) of the period t is in, or None. After a reset in the middle of a period (usage back to 0 with the same reset time), the start
+        is the first read after it."""
+        i = bisect.bisect_right(self._firsts, t) - 1
+        if i < 0 or t >= self._gs[i][1]:
+            return None
+        return self.groups[i]['start'], self.groups[i]['r']
+
     def u_at(self, t):
         """Usage at t (0 after a period ends, until the next period is observed)."""
         i = bisect.bisect_right(self._firsts, t) - 1
@@ -1041,8 +1049,11 @@ def limit_usd(ser, cs_, u, t, r, win_min, known=True):
     """Limit ($) and how it was obtained. In order: from the current window (u ≥ LIMIT_NOW_U), from history, from the current window (when history is not enough).
     When the cost records start after the window start, history is used first; if unavailable, the current window with the cost before the records taken as 0
     (the same assumption as the cost covering only this computer's conversation logs). Not from the current window while the length is only a lower bound
-    (known False: the window start is not known)."""
+    (known False: the window start is not known). After a reset in the middle of the period, the window starts at that reset (Series.period_at)."""
     start = r - win_min * 60
+    p = ser.period_at(t) if ser else None
+    if p and abs(p[1] - r) < 600 and p[0] > start:   # the same period (its reset time may drift by a few seconds between reads)
+        start = p[0]
     c = cs_.cost_between(start, t)
     now = 100.0 * c / u if known and u > 0 and c > 0 else None   # if the cost is 0 (only use elsewhere), it cannot be estimated from the current window
     if now is not None and u >= LIMIT_NOW_U and start >= cs_.T0:
