@@ -63,7 +63,8 @@ json.dump(d, open(sys.argv[1], 'w'))
 EOF
 export CLAUDE_CODEX_ROUTER_PRICE_URL="file://$work/prices.json"
 mkdir -p "$HOME/.claude/projects/p" "$HOME/.codex/sessions/2026/10/06"
-now_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# 9 days ago: before every current window starts, so that the cost in the current windows is 0 (no limit in cost yet)
+now_iso="$(python3 -c 'import datetime as d; print((d.datetime.now(d.timezone.utc) - d.timedelta(days=9)).strftime("%Y-%m-%dT%H:%M:%SZ"))')"
 printf '{"timestamp": "%s", "requestId": "r1", "message": {"id": "m1", "model": "claude-opus-5-5", "usage": {"input_tokens": 10, "output_tokens": 1000}}}\n' "$now_iso" > "$HOME/.claude/projects/p/s.jsonl"
 { printf '{"timestamp": "%s", "type": "turn_context", "payload": {"model": "gpt-6.1-sol"}}\n' "$now_iso"
   printf '{"timestamp": "%s", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 1000, "cached_input_tokens": 500, "output_tokens": 10}}}}\n' "$now_iso"; } > "$HOME/.codex/sessions/2026/10/06/s.jsonl"
@@ -147,7 +148,7 @@ set +e
 out=$(python3 "$DIR/bin/router.py" now --json); code=$?
 set -e
 [[ $code == 0 ]] || fail "now --json exit code $code ($out)"
-python3 - "$out" <<'EOF' || fail "now --json contents"
+python3 - "$out" <<'EOF' || fail "now --json contents ($out)"
 import json, sys
 d = json.loads(sys.argv[1])
 w = d['windows']
