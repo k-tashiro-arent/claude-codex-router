@@ -464,8 +464,24 @@ class LimitTests(TempDirCase):
         u = ser.u_at(t)
         self.assertLess(u, route.LIMIT_NOW_U)
         L, src = route.limit_usd(ser, cs_, u, t, r1, 10080)
-        self.assertEqual(src, 'hist')
+        self.assertEqual(src, 'blend')                                   # the previous periods weigh most while the current one is young
         self.assertAlmostEqual(L, 1000.0, delta=60)
+
+    def test_blend_weighs_the_current_period_by_its_usage(self):
+        t = at('2026-10-08 12:00')
+        r0 = t - 2 * D                                                   # the current 7-day period started 2 days ago
+        # previous periods: 0.5% per hour at $5 per hour (= $1,000); the current period: $5 per hour for 1% per hour (= $500)
+        ev = [(r0 - 14 * D + h * H + 60, 5.0) for h in range(14 * 24 + 48)]
+        cs_ = route.CostSeries(ev, t)
+        samples = [(r0 - 7 * D + k * H, 0.5 * k, r0) for k in range(1, 7 * 24)] + [(r0 + k * H, 1.0 * k, r0 + 7 * D) for k in range(0, 49)]
+        ser = route.Series('claude', 'weekly_all', 10080, samples)
+        h0 = route.limit_hist(ser, cs_, r0)
+        self.assertAlmostEqual(h0, 1000.0, delta=60)
+        for u, c in ((10.0, 50.0), (48.0, 240.0)):
+            L, src = route.limit_usd(ser, cs_, u, r0 + u * H, r0 + 7 * D, 10080)
+            self.assertEqual(src, 'blend')
+            self.assertAlmostEqual(L, 100 * (c + h0 * route.LIMIT_PRIOR_U / 100) / (u + route.LIMIT_PRIOR_U), delta=10)
+        self.assertLess(route.limit_usd(ser, cs_, 48.0, t, r0 + 7 * D, 10080)[0], route.limit_usd(ser, cs_, 10.0, r0 + 10 * H, r0 + 7 * D, 10080)[0])
 
     def test_reset_in_the_middle_of_the_period(self):
         t = at('2026-10-08 12:00')
@@ -477,8 +493,9 @@ class LimitTests(TempDirCase):
         ser = route.Series('claude', 'weekly_all', 10080, samples)
         self.assertEqual(ser.period_at(t), (back, r))
         L, src = route.limit_usd(ser, cs_, 20.0, t, r, 10080)
-        self.assertEqual(src, 'now')
-        self.assertAlmostEqual(L, 100 * 200 / 20, delta=15)          # $200 since usage went back to 0, not $600 since the window start
+        self.assertEqual(src, 'blend')
+        h0 = route.limit_hist(ser, cs_, back)                        # before usage went back to 0
+        self.assertAlmostEqual(L, 100 * (200 + h0 * route.LIMIT_PRIOR_U / 100) / (20 + route.LIMIT_PRIOR_U), delta=15)   # $200 since then, not $600
         whole = route.Series('claude', 'weekly_all', 10080, [(r - 7 * D + k * H, 20 * k / 120, r) for k in range(1, 121)])
         L, src = route.limit_usd(whole, cs_, 20.0, t, r, 10080)
         self.assertAlmostEqual(L, 100 * 600 / 20, delta=15)          # no reset in the middle: from the window start as before
@@ -498,11 +515,7 @@ class LimitTests(TempDirCase):
 
     def test_no_cost_in_the_window_uses_history(self):
         t = at('2026-10-08 12:00')
-        cs_ = self._flat(t, 20, 5.0)
-        cs_.x[-96 * 6:] = [0.0] * (96 * 6)                         # the cost in the current 7-day window (from 5 days ago) is 0 (only use elsewhere)
-        cs_.cs = [0.0]
-        for v in cs_.x:
-            cs_.cs.append(cs_.cs[-1] + v)
+        cs_ = route.CostSeries([(t - 20 * D + h * H + 60, 5.0) for h in range(14 * 24)], t)   # no cost in the last 6 days (only use elsewhere)
         r = t + 2 * D
         ser = route.Series('claude', 'weekly_all', 10080, [(t - 15 * D + k * H, 0.5 * k, t - 8 * D) for k in range(0, 7 * 24)])
         L, src = route.limit_usd(ser, cs_, 40.0, t, r, 10080)

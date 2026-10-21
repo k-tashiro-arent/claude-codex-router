@@ -137,6 +137,7 @@ except (TypeError, ValueError):
 RECENT_MAX_AGE = 600   # max age (s) of the record used instead on 429. Records are every 5 minutes, so this is 2 records' worth
 TIE_DEFAULT = CONFIG['tie_default'] if CONFIG['tie_default'] in ('claude', 'codex') else 'codex'
 LIMIT_NOW_U = 10.0   # if usage is at least this, the limit is estimated from the current window
+LIMIT_PRIOR_U = 20.0   # the previous periods' limit counts as this much usage (%) next to the current period's (limit_usd)
 LEN_RECENT = 5     # the length is the median over this many latest periods whose start was bracketed closely (so that it follows a change)
 
 
@@ -490,9 +491,14 @@ Q = 900
 
 
 class CostSeries:
-    """Cost every 15 minutes (for the limit amount). x[i] = cost in [T0 + i·Q, T0 + (i+1)·Q). T0 is local midnight of the first day with a cost."""
+    """Cost every 15 minutes (for the limit amount). x[i] = cost in [T0 + i·Q, T0 + (i+1)·Q). T0 is local midnight of the first day with a cost.
+    cost_between sums the events themselves (not the slots), so that the cost of the last few minutes counts with the usage read now."""
 
     def __init__(self, ev, t_end):
+        self._ts, self._cum = [], [0.0]
+        for t, c in sorted(e for e in ev if e[0] < t_end):
+            self._ts.append(t)
+            self._cum.append(self._cum[-1] + c)
         d0 = datetime.datetime.fromtimestamp(ev[0][0] if ev else t_end).date()
         self.T0 = time.mktime((d0.year, d0.month, d0.day, 0, 0, 0, 0, 0, -1))
         self.n = int((t_end - self.T0) // Q) + 1   # the last slot is the (partial) one containing t_end
@@ -509,9 +515,8 @@ class CostSeries:
         return self.cs[min(i + n, self.n)] - self.cs[max(min(i, self.n), 0)]
 
     def cost_between(self, a, b):
-        ia = int(min(max((a - self.T0) / Q, 0), self.n))
-        ib = int(min(max((b - self.T0) / Q, 0), self.n))
-        return self.cs[ib] - self.cs[ia]
+        """Cost of the events in [a, b)."""
+        return self._cum[bisect.bisect_left(self._ts, b)] - self._cum[bisect.bisect_left(self._ts, a)]
 
 
 # ---- forecast of the use from now (the use if there were no limit) ----
@@ -1046,7 +1051,10 @@ def limit_hist(ser, cs_, t):
 
 
 def limit_usd(ser, cs_, u, t, r, win_min, known=True):
-    """Limit ($) and how it was obtained. In order: from the current window (u ≥ LIMIT_NOW_U), from history, from the current window (when history is not enough).
+    """Limit ($) and how it was obtained. When the previous periods give one (limit_hist up to the start of the current period) and the current period's
+    cost is known: both together ('blend'), the previous periods counting as LIMIT_PRIOR_U % of usage and the current period as its usage u, so that
+    the current period weighs more as it is used (the limit rarely changes, but what 1% costs moves with the use, and a young period says little).
+    Otherwise in order: from the current window (u ≥ LIMIT_NOW_U), from history, from the current window (when history is not enough).
     When the cost records start after the window start, history is used first; if unavailable, the current window with the cost before the records taken as 0
     (the same assumption as the cost covering only this computer's conversation logs). Not from the current window while the length is only a lower bound
     (known False: the window start is not known). After a reset in the middle of the period, the window starts at that reset (Series.period_at)."""
@@ -1056,6 +1064,10 @@ def limit_usd(ser, cs_, u, t, r, win_min, known=True):
         start = p[0]
     c = cs_.cost_between(start, t)
     now = 100.0 * c / u if known and u > 0 and c > 0 else None   # if the cost is 0 (only use elsewhere), it cannot be estimated from the current window
+    if known and start >= cs_.T0 and (c > 0 or u == 0):
+        h0 = limit_hist(ser, cs_, start) if ser else None
+        if h0:
+            return 100.0 * (c + h0 * LIMIT_PRIOR_U / 100) / (u + LIMIT_PRIOR_U), 'blend'
     if now is not None and u >= LIMIT_NOW_U and start >= cs_.T0:
         return now, 'now'
     h = limit_hist(ser, cs_, t) if ser else None
@@ -1616,6 +1628,9 @@ def decide_now(t, main=MAIN):
     return res, 2
 
 
+LIMIT_SRC = {'now': 'current window', 'hist': 'history', 'blend': 'history + current window'}
+
+
 def print_human(res):
     def f(x):
         return time.strftime('%m-%d %H:%M', time.localtime(x))
@@ -1630,7 +1645,7 @@ def print_human(res):
     for k, v in res['windows'].items():
         extra = ''
         if v.get('limit_usd'):
-            extra += f'  limit ${v["limit_usd"]:,.0f} ({"current window" if v["limit_src"] == "now" else "history"})'
+            extra += f'  limit ${v["limit_usd"]:,.0f} ({LIMIT_SRC.get(v["limit_src"], v["limit_src"])})'
         if v.get('X') is not None and v.get('basis') == 'usage':
             extra += f'  remaining {v["remain_pct"]:.0f}%, exhaust probability {v["X"]:.2f} (from usage growth)'
         elif v.get('X') is not None:
