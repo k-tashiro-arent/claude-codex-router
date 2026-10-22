@@ -1174,7 +1174,7 @@ def window_states(rows, t, log=None, n=N_SAMP, aux=None):
                     notes.append(ser.len_note)
             else:
                 out[side][name] = {'u': float(x['u']), 'r': x.get('r'), 'win': None, 'scoped': bool(x.get('scoped')), 'X': None, 'limit_usd': None,
-                                   'limit_src': None, 'rem_h': None, 'note': 'length unknown (no period has been read yet), not used'}
+                                   'limit_src': None, 'rem_h': None, 'note': 'length unknown (no period has been read yet); used only for the full check'}
                 continue
             u = float(x['u'])
             r, passed = x.get('r'), False
