@@ -64,6 +64,7 @@ check "full window" codex "full: claude-session"
 fake 'import json, sys; print(json.dumps({"pick": "claude", "reason": "codex_unreadable", "claude_L": None, "codex_L": None, "guard": [], "errors": ["Codex: x"]})); sys.exit(1)'
 check "follows the decision even when only one side was read (exit code 1)" claude "errors: Codex: x"
 
+# shellcheck disable=SC2016  # the backticks are part of the JSON text, not a command
 fake 'import json, sys; print(json.dumps({"pick": "claude", "reason": "codex_unreadable", "guard": [], "errors": ["Codex: expired"], "login": {"codex": {"state": "token_expired", "expired_at": 1, "last_read": 1791800000, "action": "start Codex once; log in again (`codex login`)"}}})); sys.exit(1)'
 check "a login that stopped working is marked for the user" claude "ACTION FOR THE USER (codex, last read "
 check "the marked part carries the router's action" claude "log in again (\`codex login\`)"
