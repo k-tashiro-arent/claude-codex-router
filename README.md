@@ -197,6 +197,24 @@ bash "${CLAUDE_CODEX_ROUTER_DIR:-$HOME/.claude-codex-router}/uninstall.sh"
 - `ts`:刻みの時刻。使用枠の長さの 100 分の 1(`step_s` 秒)ごとにリセットからさかのぼって作り、`t` より後だけを入れます。最後はリセットの時刻です。
 - `paths`:`n` 本の見込み。1 本は `ts` の各時刻の使用率(%)で、過去に実際に使った流れに沿うので(予測する先までの時間が、記録のある期間の半分より長いときは、過去の記録から別々に選んだいくつかの区間をつないだもの)、時刻とともに下がりません。上限が無かった場合の量なので 100 を超えることがあり、100 以上の見込みはその時刻までに上限に達するものです。予測できない使用枠は `null`。モデルを限った使用枠と、長さが分からない使用枠は入りません。
 
+### 使用率の記録(`usage.jsonl`)
+
+`$CLAUDE_CODEX_ROUTER_DIR/data/usage.jsonl` には、使用率を読むたびに、使用枠ごとに 1 行を足します。足すだけで、書いた行は書き換えません。ファイルは大きくなるので、新しい値だけが要るなら末尾だけを読んでください。
+
+```json
+{"ts": 1791884160, "side": "claude", "id": "session", "nwin": 300, "u": 40.0, "r": 1791896399, "src": "live"}
+{"ts": 1791884160, "side": "claude", "id": "weekly_scoped:Fable", "u": 0.0, "r": 1792310400, "scoped": true, "src": "live"}
+{"ts": 1791884160, "side": "codex", "id": "7d", "win": 10080, "u": 25.0, "r": 1792400000, "src": "live"}
+```
+(値は例)
+- `ts` 読んだ時刻(Unix 時刻)、`side` どちらの側か(`claude`・`codex`)、`u` 使用率(%)、`r` リセット(Unix 時刻)。
+- `id` 使用枠の種類。Claude はサービスが返す種類(`session`・`weekly_all` など。モデルを限った使用枠は `:` の後ろにモデル名)、Codex は長さ(`7d`・`5h` など)。表示の名前は、これに `claude-`・`codex-` を付けたものです。
+- `nwin`(Claude):名前が示す長さ(分)。同じリセットの時刻を持つ項目の名前から、長さが 1 つに決まるときだけ付きます。記録と食い違うとき、判定は記録から推定した長さを使います(`now --json` の `win`)。
+- `win`(Codex):サービスが返す長さ(分)。
+- `scoped`:モデルを限った使用枠にだけ `true` が付きます。
+- `src`:値の出どころ。`live` はこのツールがサービスから読んだ値です。ほかに、Codex の利用履歴から写した `codex-sessions`、claude-token-pace の記録から取り込んだ `token-pace` があります。今の値として使うのは `live` だけです。
+- `live` 以外の行と、前の版が書いた行には `id` が無いことがあります。前の版の Claude の行には、`nwin` の代わりに `win` が付くことがあります。ここに無い項目が付くこともあるので、知らない項目は読み飛ばしてください。
+
 ## 詳しい仕組み
 
 ### 判定のしかた
@@ -256,7 +274,7 @@ bash "${CLAUDE_CODEX_ROUTER_DIR:-$HOME/.claude-codex-router}/uninstall.sh"
 ### 記録のファイル
 
 `$CLAUDE_CODEX_ROUTER_DIR/data/` に溜まります。
-- `usage.jsonl`:使用率(1 行=1 つの使用枠を 1 回読んだ値)。Codex の利用履歴に載っている使用率と、claude-token-pace の記録も取り込みます。
+- `usage.jsonl`:使用率(1 行=1 つの使用枠を 1 回読んだ値)。Codex の利用履歴に載っている使用率と、claude-token-pace の記録も取り込みます(行の形式は「他のツールから使う」)。
 - `cost-claude.jsonl`・`cost-codex.jsonl`:利用履歴から写したトークン数(Claude Code の利用履歴は既定で 30 日たつと消えるので、ここに溜めます)。
 - `cost-state.json`:利用履歴をどこまで読んだか(消すと全部読み直します)。
 - `forecast.json`:使用率の予測。`last-sample`:定期の記録(`router.py sample`)を最後に実行した時刻。`litellm-prices.json`:単価データの控え。
